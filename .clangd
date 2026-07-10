@@ -1,0 +1,17 @@
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -x
+    - objective-c++
+    - -fobjc-arc
+    - -D__APPLE__
+    - -D__arm64__
+    - -D__aarch64__
+    - -D__OBJC__
+    - -Iruntime/include
+    - -Itemplates/theos-dylib/generated
+    - -Iexamples/OwnedDemoProject/generated
+    - -I.
+  Remove:
+    - -arch
+    - arm64

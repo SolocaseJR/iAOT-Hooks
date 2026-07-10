@@ -1,0 +1,19 @@
+project:
+  name: DemoUserHooks
+  bundle_id: com.example.owned.demo
+  platform: ios
+  arch: arm64
+  min_ios: "14.0"
+runtime:
+  config_segment: "__IAOTCFG"
+  cave_segment: "__IAOTCAVE"
+  page_size: 16384
+  dylib_name: "DemoUserHooks.dylib"
+app:
+  executable_member: "Payload/OwnedDemo.app/OwnedDemo"
+  authorized_only: true
+config: { flags: [], strings: [], callbacks: [] }
+functions: []
+generated_hooks:
+  - { name: UserHooks, symbol: IAOT_InstallUserHooks }
+patches: []

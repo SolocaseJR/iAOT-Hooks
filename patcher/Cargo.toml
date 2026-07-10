@@ -1,0 +1,18 @@
+[package]
+name = "iaot"
+version = "0.1.0"
+edition = "2021"
+description = "Authorized jailed-iOS ahead-of-time instrumentation project and offline tooling"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+object = { version = "0.36", features = ["read_core", "macho"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

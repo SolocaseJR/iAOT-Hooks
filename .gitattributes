@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.ipa binary
+*.dylib binary
+*.a binary
+*.o binary
+*.exe binary

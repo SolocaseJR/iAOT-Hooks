@@ -1,0 +1,8 @@
+/build/
+/patcher/target/
+/.theos/
+*.dylib
+*.ipa
+*.o
+*.DS_Store
+Prompt.txt

@@ -1,0 +1,50 @@
+project:
+  name: OwnedDemoHooks
+  bundle_id: com.example.owned.demo
+  platform: ios
+  arch: arm64
+  min_ios: "14.0"
+runtime:
+  config_segment: "__IAOTCFG"
+  cave_segment: "__IAOTCAVE"
+  page_size: 16384
+  dylib_name: "OwnedDemoHooks.dylib"
+app:
+  executable_member: "Payload/OwnedDemo.app/OwnedDemo"
+  authorized_only: true
+config:
+  flags:
+    - { name: override_return_string, index: 0, default: false }
+    - { name: enable_objc_demo_hook, index: 1, default: true }
+  strings:
+    - { name: return_string_value, index: 0, default: "runtime default string" }
+  callbacks:
+    - { name: demo_callback, index: 0, symbol: IAOT_DemoCallback }
+functions:
+  - name: ReturningSomeString
+    signature: "std::string()"
+    address: { type: symbol, symbol: DemoReturningSomeString }
+  - name: AddProfileValue
+    signature: "void(void*, int)"
+    address: { type: vmaddr, value: 0x100ABCDEF }
+  - name: GetProfileValue
+    signature: "int(void*)"
+    address: { type: rva, value: 0x123456 }
+  - name: ObjCMessageExample
+    kind: objc
+    class: IAOTDemoGreeter
+    selector: greetingText
+generated_hooks:
+  - { name: DemoStringHook, symbol: IAOT_InstallDemoStringHook }
+  - { name: DemoObjCHook, symbol: IAOT_InstallDemoObjCHook }
+  - { name: DemoFunctionCaller, symbol: IAOT_InstallDemoFunctionCaller }
+  - { name: UserHooks, symbol: IAOT_InstallUserHooks }
+patches:
+  - name: DemoReturnStringPatch
+    enabled: false
+    description: "Example only; target must be an owned demo binary"
+    locator: { type: symbol, symbol: _DemoReturningSomeString }
+    patch:
+      type: branch_to_cave
+      action: { type: branch_to_callback, callback: demo_callback }
+    expect: null
