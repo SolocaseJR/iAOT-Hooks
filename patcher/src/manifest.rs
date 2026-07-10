@@ -181,6 +181,11 @@ pub fn validate(m: &Manifest, force: bool) -> Result<(), IaotError> {
             "project identity, minimum iOS, and dylib name are required".into(),
         ));
     }
+    if m.runtime.dylib_name.contains(['/', '\\']) {
+        return Err(IaotError::Manifest(
+            "runtime.dylib_name must be a filename, not a path".into(),
+        ));
+    }
     if m.project.platform != "ios" || m.project.arch != "arm64" {
         return Err(IaotError::Manifest(
             "only platform ios / arch arm64 is supported".into(),
@@ -307,9 +312,6 @@ pub fn validate(m: &Manifest, force: bool) -> Result<(), IaotError> {
                 "patch name/description are required and patch.type must be branch_to_cave".into(),
             ));
         }
-        if patch.enabled && patch.expect.is_none() && !force {
-            return Err(IaotError::Manifest(format!("enabled patch {} requires four expected bytes (or an explicit --force-authorized override)",patch.name)));
-        }
         match &patch.locator {
             Locator::Pattern { pattern, .. } | Locator::Xref { pattern, .. }
                 if crate::pattern::parse(pattern).is_err() =>
@@ -377,6 +379,9 @@ pub fn validate(m: &Manifest, force: bool) -> Result<(), IaotError> {
             _ => {}
         }
         if let Some(expect) = &patch.expect {
+            if expect == "auto" {
+                continue;
+            }
             let parsed = crate::pattern::parse(expect).map_err(|_| {
                 IaotError::Manifest(format!("patch {} has invalid expected bytes", patch.name))
             })?;

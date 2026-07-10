@@ -26,6 +26,17 @@ make
 
 Theos produces a dylib; that alone is not deployable on jailed iOS. Embed it in an app you are authorized to modify, ensure it is loaded by that app, then sign/re-sign the final package using your normal authorized workflow.
 
+For an existing authorized IPA, the CLI can extract, patch, optionally stage a dylib, and repack in one operation:
+
+```sh
+iaot patch-ipa --manifest hooks.yaml --in OwnedApp.ipa --out PatchedOwnedApp.ipa
+iaot patch-ipa --manifest hooks.yaml --in OwnedApp.ipa --out PatchedOwnedApp.ipa --dylib path/to/DemoUserHooks.dylib
+```
+
+With `--dylib`, IAOT stages the compiled dylib at `Frameworks/<runtime.dylib_name>` and adds its `@executable_path/Frameworks/...` load command. It does not sign the result.
+
+Patch entries may use `expect: auto` or omit `expect`. Once the locator resolves against the executable extracted from that exact IPA, IAOT reads and reports the four displaced bytes automatically. Concrete bytes remain preferable for reproducible manifests because they detect an unexpected binary version before mutation.
+
 See the complete [`OwnedDemoProject`](examples/OwnedDemoProject/README.md), which demonstrates a runtime-selected return string, Objective-C method replacement, generated hook registration, and typed calls such as:
 
 ```cpp
@@ -39,12 +50,12 @@ Addresses in the public demo are intentionally fake/demo-only. A wrong address o
 ## Components
 
 - `runtime/`: C++17/Objective-C++ source library; no Rust runtime dependency.
-- `patcher/`: optional Rust `iaot` CLI for projects, manifests, generation, inspection, conservative offline Mach-O patching, and generic IPA member replacement.
+- `patcher/`: optional Rust `iaot` CLI for generation, conservative Mach-O patching, complete IPA patch/repack workflows, and optional dylib staging.
 - `templates/`: Theos dylib starter.
 - `examples/OwnedDemoProject/`: owned demo symbols only.
 - `docs/`: architecture, no-JIT boundaries, manifest, packaging, and safety details.
 
-`patch-macho` supports thin ARM64 `MH_EXECUTE` files, audited cave templates, config/cave segment insertion, stale signature removal, redirects, and reopen verification. It deliberately refuses unsafe displaced instructions, ambiguous matches, out-of-range branches, overlapping segments, and binaries without enough load-command padding. `repack-ipa` stages one explicitly named member and does not sign it.
+`patch-macho` supports thin ARM64 `MH_EXECUTE` files, audited cave templates, config/cave segment insertion, stale signature removal, redirects, and reopen verification. It deliberately refuses unsafe displaced instructions, ambiguous matches, out-of-range branches, overlapping segments, and binaries without enough load-command padding. `patch-ipa` provides the corresponding IPA-level pipeline; neither workflow signs its output.
 
 ## Development checks
 

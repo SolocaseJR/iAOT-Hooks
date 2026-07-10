@@ -47,4 +47,4 @@ patches:
     patch:
       type: branch_to_cave
       action: { type: branch_to_callback, callback: demo_callback }
-    expect: null
+    expect: auto

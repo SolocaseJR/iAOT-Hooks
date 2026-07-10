@@ -27,4 +27,4 @@ locator: { type: symbol, symbol: _OwnedDemoFunction }
 expect: "FD 7B BF A9"
 ```
 
-Ambiguous pattern/xref matches require the relevant index. With both patterns present, `pattern` selects the target instruction and `xref_pattern` must contain the indexed BL resolving to that target. Without `xref_pattern`, the indexed BL inside `pattern` resolves the patch target. Enabled patches require four concrete expected bytes unless `--force-authorized` is explicitly supplied. `executable_member` is never inferred from a private/hardcoded app. The force flag does not create authorization.
+Ambiguous pattern/xref matches require the relevant index. With both patterns present, `pattern` selects the target instruction and `xref_pattern` must contain the indexed BL resolving to that target. Without `xref_pattern`, the indexed BL inside `pattern` resolves the patch target. `expect` accepts four concrete bytes, `auto`, or may be omitted. Auto mode reads and reports the bytes from the exact input; concrete bytes additionally protect against an unexpected build. `executable_member` is never inferred from a private/hardcoded app. The force flag does not create authorization.

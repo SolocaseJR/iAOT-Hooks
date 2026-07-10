@@ -12,6 +12,7 @@ const CPU_TYPE_ARM64: u32 = 0x0100000c;
 const MH_EXECUTE: u32 = 2;
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_CODE_SIGNATURE: u32 = 0x1d;
+const LC_LOAD_DYLIB: u32 = 0xc;
 const HEADER_SIZE: usize = 32;
 const SEGMENT_SIZE: usize = 72;
 const CONFIG_SIZE: usize = 9800;
@@ -166,6 +167,28 @@ fn segment_command(
     put32(&mut c, 56, prot);
     put32(&mut c, 60, prot);
     c
+}
+fn dylib_command(name: &str) -> Vec<u8> {
+    let path = format!("@executable_path/Frameworks/{name}");
+    let size = align((24 + path.len() + 1) as u64, 8) as usize;
+    let mut command = vec![0u8; size];
+    put32(&mut command, 0, LC_LOAD_DYLIB);
+    put32(&mut command, 4, size as u32);
+    put32(&mut command, 8, 24);
+    command[24..24 + path.len()].copy_from_slice(path.as_bytes());
+    command
+}
+fn load_command_name(command: &[u8]) -> Option<&str> {
+    if command.len() < 24 {
+        return None;
+    }
+    let offset = u32::from_le_bytes(command[8..12].try_into().ok()?) as usize;
+    if offset >= command.len() {
+        return None;
+    }
+    let tail = &command[offset..];
+    let end = tail.iter().position(|&x| x == 0)?;
+    std::str::from_utf8(&tail[..end]).ok()
 }
 fn vm_to_file(parsed: &Parsed, address: u64) -> anyhow::Result<usize> {
     for s in &parsed.segments {
@@ -355,8 +378,29 @@ pub struct PatchReport {
     pub config_vmaddr: u64,
     pub cave_vmaddr: u64,
     pub removed_code_signatures: usize,
+    pub added_dylib_load_command: bool,
+    pub resolutions: Vec<PatchResolution>,
+}
+#[derive(Debug)]
+pub struct PatchResolution {
+    pub name: String,
+    pub vmaddr: u64,
+    pub bytes: [u8; 4],
+    pub automatic: bool,
+}
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PatchOptions {
+    pub load_dylib: bool,
 }
 pub fn patch(m: &Manifest, input: &Path, output: &Path) -> anyhow::Result<PatchReport> {
+    patch_with_options(m, input, output, PatchOptions::default())
+}
+pub fn patch_with_options(
+    m: &Manifest,
+    input: &Path,
+    output: &Path,
+    options: PatchOptions,
+) -> anyhow::Result<PatchReport> {
     if input == output {
         anyhow::bail!("input and output paths must differ")
     }
@@ -385,14 +429,21 @@ pub fn patch(m: &Manifest, input: &Path, output: &Path) -> anyhow::Result<PatchR
         .map(|x| (x.name.as_str(), x.index))
         .collect();
     let mut targets = Vec::new();
+    let mut resolutions = Vec::new();
     for p in m.patches.iter().filter(|p| p.enabled) {
         let (off, vm) = locate(&original, &parsed, &p.locator, &p.name)?;
         let bytes: [u8; 4] = original[off..off + 4].try_into().unwrap();
         if let Some(expect) = &p.expect {
-            if bytes != expected_bytes(expect)? {
+            if expect != "auto" && bytes != expected_bytes(expect)? {
                 anyhow::bail!("{}: expected bytes do not match", p.name)
             }
         }
+        resolutions.push(PatchResolution {
+            name: p.name.clone(),
+            vmaddr: vm,
+            bytes,
+            automatic: p.expect.as_deref().is_none_or(|x| x == "auto"),
+        });
         let displaced = u32::from_le_bytes(bytes);
         if !matches!(p.patch.action, PatchAction::BranchToReplacement { .. })
             && pc_relative(displaced)
@@ -446,11 +497,20 @@ pub fn patch(m: &Manifest, input: &Path, output: &Path) -> anyhow::Result<PatchR
     let cave_file = align(config_file + config.len() as u64, page);
     let mut commands = Vec::new();
     let mut kept = 0u32;
+    let dylib_path = format!("@executable_path/Frameworks/{}", m.runtime.dylib_name);
+    let already_loads_dylib = parsed.commands.iter().any(|(cmd, bytes)| {
+        *cmd == LC_LOAD_DYLIB && load_command_name(bytes) == Some(dylib_path.as_str())
+    });
     for (cmd, bytes) in &parsed.commands {
         if *cmd != LC_CODE_SIGNATURE {
             commands.extend_from_slice(bytes);
             kept += 1
         }
+    }
+    let added_dylib_load_command = options.load_dylib && !already_loads_dylib;
+    if added_dylib_load_command {
+        commands.extend_from_slice(&dylib_command(&m.runtime.dylib_name));
+        kept += 1;
     }
     commands.extend_from_slice(&segment_command(
         &m.runtime.config_segment,
@@ -497,11 +557,22 @@ pub fn patch(m: &Manifest, input: &Path, output: &Path) -> anyhow::Result<PatchR
         let _ = std::fs::remove_file(output);
         return Err(error.context("reopened output verification failed"));
     }
+    if options.load_dylib {
+        let reopened_parsed = parse(&reopened)?;
+        if !reopened_parsed.commands.iter().any(|(cmd, bytes)| {
+            *cmd == LC_LOAD_DYLIB && load_command_name(bytes) == Some(dylib_path.as_str())
+        }) {
+            let _ = std::fs::remove_file(output);
+            anyhow::bail!("reopened output is missing the requested dylib load command")
+        }
+    }
     Ok(PatchReport {
         patches: redirects.len(),
         config_vmaddr: config_vm,
         cave_vmaddr: cave_vm,
         removed_code_signatures: parsed.signature_blobs.len(),
+        added_dylib_load_command,
+        resolutions,
     })
 }
 
@@ -696,5 +767,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("PC-relative"));
+    }
+    #[test]
+    fn resolves_bytes_and_adds_dylib_command() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("in");
+        let output = dir.path().join("out");
+        std::fs::write(&input, fixture(0x400, 0xd503201f)).unwrap();
+        let mut m = manifest();
+        m.patches[0].expect = Some("auto".into());
+        let report =
+            patch_with_options(&m, &input, &output, PatchOptions { load_dylib: true }).unwrap();
+        assert!(report.resolutions[0].automatic);
+        assert_eq!(report.resolutions[0].bytes, [0x1f, 0x20, 0x03, 0xd5]);
+        assert!(report.added_dylib_load_command);
+        let parsed = parse(&std::fs::read(output).unwrap()).unwrap();
+        assert!(parsed
+            .commands
+            .iter()
+            .any(|(cmd, bytes)| *cmd == LC_LOAD_DYLIB
+                && load_command_name(bytes) == Some("@executable_path/Frameworks/Demo.dylib")));
     }
 }

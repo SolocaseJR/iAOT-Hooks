@@ -9,7 +9,7 @@ Generic concepts map as follows:
 | `build_config_bytes` | stable `RuntimeConfig` initializer/layout |
 | signature parsing/search | Rust `pattern` module |
 | `build_cave` | audited Rust cave builder architecture |
-| IPA executable replacement script | `iaot repack-ipa` with explicit `--member` |
+| IPA executable replacement script | `iaot patch-ipa` or low-level `repack-ipa` |
 | one-off Mach-O patch script | `iaot patch-macho` architecture |
 
 The migration removes hardcoded bundle/member paths and app-specific constants. The IPA operation and conservative thin-ARM64 writer are implemented generically. Inputs that need load-command expansion by shifting existing sections remain unsupported and are refused explicitly.

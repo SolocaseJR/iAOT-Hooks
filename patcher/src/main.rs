@@ -47,6 +47,22 @@ enum Cmd {
         #[arg(long = "out")]
         output: PathBuf,
         #[arg(long)]
+        load_dylib: bool,
+        #[arg(long)]
+        force_authorized: bool,
+    },
+    PatchIpa {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long = "in")]
+        input: PathBuf,
+        #[arg(long = "out")]
+        output: PathBuf,
+        #[arg(long)]
+        member: Option<String>,
+        #[arg(long)]
+        dylib: Option<PathBuf>,
+        #[arg(long)]
         force_authorized: bool,
     },
     RepackIpa {
@@ -73,6 +89,25 @@ fn validated(path: &Path, force: bool) -> anyhow::Result<manifest::Manifest> {
         eprintln!("WARNING: authorization metadata was overridden; only proceed with an app you are authorized to test.");
     }
     Ok(m)
+}
+fn print_patch_report(report: &macho::PatchReport) {
+    for resolution in &report.resolutions {
+        println!(
+            "{}: vmaddr=0x{:x}, displaced={:02X} {:02X} {:02X} {:02X}{}",
+            resolution.name,
+            resolution.vmaddr,
+            resolution.bytes[0],
+            resolution.bytes[1],
+            resolution.bytes[2],
+            resolution.bytes[3],
+            if resolution.automatic {
+                " (resolved automatically)"
+            } else {
+                ""
+            }
+        );
+    }
+    println!("patched {} authorized redirect(s); config=0x{:x}, caves=0x{:x}, removed {} stale code signature command(s){}",report.patches,report.config_vmaddr,report.cave_vmaddr,report.removed_code_signatures,if report.added_dylib_load_command{"; added embedded-dylib load command"}else{""});
 }
 fn new_project(name: &str) -> anyhow::Result<()> {
     if !name
@@ -129,11 +164,74 @@ fn main() -> anyhow::Result<()> {
             manifest,
             input,
             output,
+            load_dylib,
             force_authorized,
         } => {
             let m = validated(&manifest, force_authorized)?;
-            let report = macho::patch(&m, &input, &output)?;
-            println!("patched {} authorized redirect(s); config=0x{:x}, caves=0x{:x}, removed {} stale code signature command(s). The output must be signed/re-signed.", report.patches, report.config_vmaddr, report.cave_vmaddr, report.removed_code_signatures);
+            let report = if load_dylib {
+                macho::patch_with_options(
+                    &m,
+                    &input,
+                    &output,
+                    macho::PatchOptions { load_dylib: true },
+                )?
+            } else {
+                macho::patch(&m, &input, &output)?
+            };
+            print_patch_report(&report);
+            println!("The output must be signed/re-signed.");
+        }
+        Cmd::PatchIpa {
+            manifest,
+            input,
+            output,
+            member,
+            dylib,
+            force_authorized,
+        } => {
+            if input == output {
+                anyhow::bail!("input and output IPA paths must differ")
+            }
+            let m = validated(&manifest, force_authorized)?;
+            let executable_member = member
+                .or_else(|| m.app.executable_member.clone())
+                .ok_or_else(|| anyhow::anyhow!("supply --member or app.executable_member"))?;
+            let temp = tempfile::tempdir()?;
+            let original = temp.path().join("original-macho");
+            let patched = temp.path().join("patched-macho");
+            ipa::extract_member(&input, &executable_member, &original)?;
+            let report = macho::patch_with_options(
+                &m,
+                &original,
+                &patched,
+                macho::PatchOptions {
+                    load_dylib: dylib.is_some(),
+                },
+            )?;
+            let addition = if let Some(path) = dylib.as_deref() {
+                if !path.is_file() {
+                    anyhow::bail!("dylib file does not exist: {}", path.display())
+                }
+                let app_dir = executable_member
+                    .rsplit_once('/')
+                    .map(|x| x.0)
+                    .ok_or_else(|| anyhow::anyhow!("executable member has no app directory"))?;
+                Some((
+                    format!("{app_dir}/Frameworks/{}", m.runtime.dylib_name),
+                    path,
+                ))
+            } else {
+                None
+            };
+            ipa::repack_with_addition(
+                &input,
+                &output,
+                &executable_member,
+                &patched,
+                addition.as_ref().map(|x| (x.0.as_str(), x.1)),
+            )?;
+            print_patch_report(&report);
+            println!("repacked patched executable{}; the IPA is not signed and must be signed/re-signed before jailed-iOS use",if addition.is_some(){" and staged the compiled dylib"}else{""});
         }
         Cmd::RepackIpa {
             input,

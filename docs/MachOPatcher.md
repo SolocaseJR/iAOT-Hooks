@@ -8,4 +8,8 @@ Safety requires exact-byte checks, aligned/range-checked branches, unambiguous p
 
 Implemented behavior includes thin ARM64 `MH_EXECUTE` parsing, direct/pattern/xref/symbol locators, exact-byte checks, `__IAOTCFG` and `__IAOTCAVE` insertion, audited cave emission, stale `LC_CODE_SIGNATURE` removal and blob clearing, ARM64 redirects, and reopen verification. Observational callbacks preserve caller-saved general registers, q0–q7, LR, and NZCV.
 
+With `expect: auto` or no `expect`, the writer resolves the locator, reads the exact four displaced bytes from that input, and reports the bytes and VM address. Concrete bytes are still recommended for manifests pinned to a known build.
+
+`patch-macho --load-dylib` adds `LC_LOAD_DYLIB` for `@executable_path/Frameworks/<runtime.dylib_name>`. `patch-ipa --dylib <file>` performs that operation and stages the compiled dylib automatically.
+
 The writer intentionally refuses fat Mach-O files, PC-relative displaced instructions, branches outside ARM64 range, ambiguous matches without indices, overlapping VM ranges, and inputs lacking enough padding between load commands and the first section. It does not shift existing sections to manufacture header space. `branch_to_replacement` requires a resolvable symbol; callback actions use precompiled callback pointers placed in `RuntimeConfig` by signed runtime code.
