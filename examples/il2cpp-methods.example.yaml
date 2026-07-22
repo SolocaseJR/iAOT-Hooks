@@ -1,0 +1,10 @@
+schema_version: 1
+methods:
+  - id: "Assembly-CSharp::Example.Player::SetName/1"
+    assembly: Assembly-CSharp
+    namespace: Example
+    class: Player
+    method: SetName
+    parameter_count: 1
+    module: il2cpp
+    rva: 305419896

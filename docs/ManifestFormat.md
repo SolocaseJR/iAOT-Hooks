@@ -1,30 +1,15 @@
-# Manifest Format
+# Centralized Manifest
 
-`hooks.yaml` is authorization-bearing build input.
+`hooks.yaml` contains `project`, `paths`, `build`, `analysis`, `runtime`, `app`, `config`, `functions`, `generated_hooks`, and `patches`.
 
-- `project`: `name`, reverse-DNS `bundle_id`, `platform: ios`, `arch: arm64`, and quoted `min_ios`.
-- `runtime`: distinct ASCII Mach-O `config_segment`/`cave_segment` names (maximum 16 bytes), power-of-two `page_size`, and `dylib_name`.
-- `app`: `authorized_only: true` and optional explicit `executable_member`, such as `Payload/OwnedDemo.app/OwnedDemo`.
-- `config.flags`: unique `name`, `index` (0–255), and Boolean `default`.
-- `config.strings`: unique `name`, `index` (0–31), and fixed-string `default`.
-- `config.callbacks`: unique `name`, `index` (0–63), and precompiled C `symbol`.
-- `generated_hooks`: display `name` and valid C `symbol` with signature `bool(const HookContext&)`.
-- `functions`: C++ `name`, exact `signature`, and address `{type, value|symbol}`. Types are `runtime`, `vmaddr`, `rva`, and `symbol`. Objective-C entries instead use `kind: objc`, `class`, and `selector`.
-- `patches`: named, optionally enabled offline operations with `description`, `locator`, `patch`, and `expect`.
+- `paths`: optional input/output, build, generated-report, and temp locations. CLI paths override them.
+- `build`: development/release mode, log level, menu/persistence, cleanup policy, and external signing declaration.
+- `analysis`: auto/override classification, renderer, IL2CPP module and method map, and static/runtime IL2CPP enablement.
+- `app`: optional executable/target override, Unity preference, and required authorization assertion.
+- `config`: indexed flags (0-255), strings (0-31), and callbacks (0-63). Auto callbacks need a symbol and exact signature.
+- `functions`: typed calls by runtime address, VM address, RVA, or symbol; Objective-C hook entries name a class/selector, class/instance kind, replacement symbol, exact ABI, and original-preservation policy.
+- `patches`: module, exact signature, optional original slot (0-63), failure behavior, architecture/version constraints, locator, action, and expected bytes.
 
-Locator examples:
+Run `iaot validate hooks.yaml`. Unknown identifiers, duplicate indices/names, invalid segments/paths, unsupported architecture, bad signatures, missing flag/callback references, and invalid expected bytes are rejected before mutation. The current example is [the template manifest](../templates/theos-dylib/hooks.yaml).
 
-```yaml
-locator: { type: pattern, pattern: "AA BB ?? CC || 11 22 33 44", match_index: 0 }
-locator:
-  type: xref
-  pattern: "?? ?? ?? 94"
-  xref_pattern: "AA BB ?? CC"
-  match_index: 0
-  xref_match_index: 0
-  xref_bl_index: 0
-locator: { type: symbol, symbol: _OwnedDemoFunction }
-expect: "FD 7B BF A9"
-```
-
-Ambiguous pattern/xref matches require the relevant index. With both patterns present, `pattern` selects the target instruction and `xref_pattern` must contain the indexed BL resolving to that target. Without `xref_pattern`, the indexed BL inside `pattern` resolves the patch target. `expect` accepts four concrete bytes, `auto`, or may be omitted. Auto mode reads and reports the bytes from the exact input; concrete bytes additionally protect against an unexpected build. `executable_member` is never inferred from a private/hardcoded app. The force flag does not create authorization.
+Application-type overrides use the analyzer's reported names (`unity_il2cpp`, `unity_mono`, `unity_unknown_backend`, `native_objective_c`, `native_objective_cpp`, `native_cpp`, `swift`, `mixed_native`, or `unknown_or_native_c`). Scripting overrides are `il2cpp`, `mono`, `unknown`, or `native`. `external_analyzer` is `auto`, `method_manifest`, or `none`; IAOT never executes an unpinned third-party analyzer from YAML.

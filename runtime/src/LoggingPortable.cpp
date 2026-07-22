@@ -4,10 +4,44 @@
 #include <cstdarg>
 #include <cstdio>
 namespace iaot {
-namespace { std::atomic_bool g_enabled{true}; }
-void SetLoggingEnabled(bool value) noexcept { g_enabled.store(value); }
-bool IsLoggingEnabled() noexcept { return g_enabled.load(); }
-void Log(const char* msg) noexcept { if(g_enabled.load()&&msg) std::printf("[IAOT] %s\n",msg); }
-void Logf(const char* fmt,...) noexcept { if(!g_enabled.load()||!fmt)return; std::printf("[IAOT] "); std::va_list args; va_start(args,fmt); std::vprintf(fmt,args); va_end(args); std::printf("\n"); }
+namespace {
+std::atomic<LogLevel> g_level{LogLevel::Info};
+const char *Name(LogLevel l) {
+  switch (l) {
+  case LogLevel::Debug:
+    return "DEBUG";
+  case LogLevel::Info:
+    return "INFO";
+  case LogLevel::Warning:
+    return "WARN";
+  case LogLevel::Error:
+    return "ERROR";
+  case LogLevel::Off:
+    return "OFF";
+  }
+  return "?";
 }
+} // namespace
+void SetLogLevel(LogLevel value) noexcept { g_level.store(value); }
+LogLevel GetLogLevel() noexcept { return g_level.load(); }
+void SetLoggingEnabled(bool value) noexcept {
+  SetLogLevel(value ? LogLevel::Info : LogLevel::Off);
+}
+bool IsLoggingEnabled() noexcept { return GetLogLevel() != LogLevel::Off; }
+void LogMessage(LogLevel level, const char *msg) noexcept {
+  if (msg && level >= GetLogLevel() && GetLogLevel() != LogLevel::Off)
+    std::printf("[IAOT][%s] %s\n", Name(level), msg);
+}
+void Log(const char *msg) noexcept { LogMessage(LogLevel::Info, msg); }
+void Logf(const char *fmt, ...) noexcept {
+  if (GetLogLevel() > LogLevel::Info || !fmt)
+    return;
+  std::printf("[IAOT][INFO] ");
+  std::va_list args;
+  va_start(args, fmt);
+  std::vprintf(fmt, args);
+  va_end(args);
+  std::printf("\n");
+}
+} // namespace iaot
 #endif

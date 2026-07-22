@@ -1,16 +1,7 @@
-# AppFunction
+# Typed Application and Original Calls
 
-`AppFunction<Ret(Args...)>` turns an address description into a typed pointer and calls existing signed app code. It does not patch memory or bypass no-JIT rules.
+`AppFunction<Ret(Args...)>` describes an existing signed function by runtime address, static VM address plus main slide, main-image RVA, or exported symbol. `OriginalFunction<Signature>(slot)` reads a generated runtime trampoline address.
 
-- Runtime: already-slid live address.
-- VM address: static address from a matching owned binary; runtime address is `vmaddr + dyld_slide`.
-- RVA: `main_image_runtime_base + rva`.
-- Symbol: exported-symbol lookup.
+Calls return a default value (or no-op for `void`) when unresolved and can optionally validate executable memory, but no runtime check proves a C++ ABI. Member functions model `this` explicitly. Objective-C methods include `self` and `_cmd` and should normally use the Objective-C helpers.
 
-```cpp
-auto freeFn = iaot::AppFunction<int()>::FromSymbol(OBF("OwnedFunction"));
-auto member = iaot::AppFunction<int(void*, int)>::FromRva(0x1234);
-int result = member.Call(self, 7); // model C++ `this` explicitly
-```
-
-Use Objective-C helpers or a correctly typed `objc_msgSend` form for Objective-C methods (`self` and `_cmd` are ABI parameters). The signature and address must exactly match. Non-trivial values such as `std::string` are ABI-sensitive; a compiler can handle them only when both sides truly share the same ABI/signature. A mismatch can crash immediately. Optional call validation is diagnostic, not proof of signature correctness.
+Generated wrappers live in `IAOTGeneratedFunctions.hpp` and `IAOTGeneratedOriginals.hpp`.

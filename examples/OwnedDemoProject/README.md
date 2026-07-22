@@ -15,7 +15,7 @@ The Theos output still must be embedded into an authorized package and the compl
 For an owned IPA, enable a matching patch and run:
 
 ```sh
-iaot patch-ipa --manifest hooks.yaml --in OwnedDemo.ipa --out PatchedOwnedDemo.ipa --dylib path/to/OwnedDemoHooks.dylib
+iaot pipeline --manifest hooks.yaml --in OwnedDemo.ipa --out PatchedOwnedDemo-unsigned.ipa --dylib path/to/OwnedDemoHooks.dylib --reports build/reports
 ```
 
 `expect: auto` resolves and prints the displaced bytes from that IPA. Pin those bytes later when the manifest should target one exact build.

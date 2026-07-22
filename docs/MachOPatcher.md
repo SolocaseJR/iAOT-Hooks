@@ -1,15 +1,7 @@
 # Mach-O Patcher
 
-The planned offline writer appends `__IAOTCFG` as read/write fixed-layout data and `__IAOTCAVE` as read/execute code generated from audited templates. A cave can load a flag, take the normal path when disabled, invoke a precompiled callback or small generic action when enabled, replay a safe displaced instruction, and branch back.
+The writer accepts thin plain ARM64 `MH_EXECUTE` and `MH_DYLIB` files. It parses load commands/sections with bounds checks, scans executable ranges, validates aligned file-backed targets, removes stale `LC_CODE_SIGNATURE`, appends read/write `__IAOTCFG` and read/execute `__IAOTCAVE`, writes fixed audited bridges, reopens the result, and verifies segment ranges and redirects.
 
-Audited actions are `ret_if_flag`, `zero_register_if_flag`, `callback_if_flag`, `callback_return_zero_if_flag`, `callback_after`, `branch_to_callback`, and `branch_to_replacement`. There is no arbitrary native-code string input.
+Supported one-instruction relocation families are B/BL, B.cond, CBZ/CBNZ, TBZ/TBNZ, ADR, ADRP, integer LDR literal, and LDRSW literal. Ordinary non-PC-relative instructions are copied. SIMD/FP literal and PRFM relocation fail closed. Direct/relocated branch-range failures are reported.
 
-Safety requires exact-byte checks, aligned/range-checked branches, unambiguous patterns/xrefs, non-overlapping VM ranges, config layout checks, stale signature removal, reopen/parse verification, redirect decoding where disassembly is available, and refusal to relocate PC-relative displaced instructions without a proven relocation strategy.
-
-Implemented behavior includes thin ARM64 `MH_EXECUTE` parsing, direct/pattern/xref/symbol locators, exact-byte checks, `__IAOTCFG` and `__IAOTCAVE` insertion, audited cave emission, stale `LC_CODE_SIGNATURE` removal and blob clearing, ARM64 redirects, and reopen verification. Observational callbacks preserve caller-saved general registers, q0–q7, LR, and NZCV.
-
-With `expect: auto` or no `expect`, the writer resolves the locator, reads the exact four displaced bytes from that input, and reports the bytes and VM address. Concrete bytes are still recommended for manifests pinned to a known build.
-
-`patch-macho --load-dylib` adds `LC_LOAD_DYLIB` for `@executable_path/Frameworks/<runtime.dylib_name>`. `patch-ipa --dylib <file>` performs that operation and stages the compiled dylib automatically.
-
-The writer intentionally refuses fat Mach-O files, PC-relative displaced instructions, branches outside ARM64 range, ambiguous matches without indices, overlapping VM ranges, and inputs lacking enough padding between load commands and the first section. It does not shift existing sections to manufacture header space. `branch_to_replacement` requires a resolvable symbol; callback actions use precompiled callback pointers placed in `RuntimeConfig` by signed runtime code.
+The writer does not accept arbitrary instruction bytes, shift all sections for header growth, mutate fat binaries, or claim arm64e authenticated function-pointer support. See [Architecture](Architecture.md) for the bridge and [Hooks](Hooks.md) for locators/actions.

@@ -1,6 +1,6 @@
 [package]
 name = "iaot"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Authorized jailed-iOS ahead-of-time instrumentation project and offline tooling"
 license = "MIT"

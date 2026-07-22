@@ -1,5 +1,5 @@
 #pragma once
 #define IAOT_VERSION_MAJOR 0
-#define IAOT_VERSION_MINOR 2
+#define IAOT_VERSION_MINOR 3
 #define IAOT_VERSION_PATCH 0
-#define IAOT_VERSION_STRING "0.2.0"
+#define IAOT_VERSION_STRING "0.3.0"

@@ -1,4 +1,5 @@
 /build/
+/build-*/
 /patcher/target/
 /.theos/
 *.dylib
@@ -6,3 +7,4 @@
 *.o
 *.DS_Store
 Prompt.txt
+/vendor/imgui/

@@ -1,15 +1,5 @@
-# Jailed / No-JIT Model
+# Jailed / No-JIT Execution Model
 
-IAOT assumes a non-jailbroken device, no JIT, no unsigned executable memory, no native runtime compilation, no arbitrary process attachment, and no loading arbitrary new dylibs after signing. Hook bodies exist in signed executable pages before launch.
+All callback and bridge behavior exists in signed executable pages before launch. Offline patching is allowed to create executable bytes; runtime code never maps writable+executable memory, compiles code, writes host executable pages, attaches to another process, or relies on a jailbreak loader.
 
-Runtime data can change a precompiled decision:
-
-```cpp
-std::string hkReturningSomeString() {
-    if (IAOTGetFlag(IAOTFlag::override_return_string))
-        return std::string(IAOTGetString(IAOTString::return_string_value));
-    return std::string(OBF("compiled fallback"));
-}
-```
-
-The selected bytes are data; the branch and return implementation are already compiled. IAOT never maps writable+executable pages or generates a new function on-device. A final app package must include all executable components and be signed/re-signed.
+Runtime flags choose among already compiled paths. The optional IL2CPP resolver performs data/API lookup and managed invocation only. Runtime hook installation is intentionally absent.

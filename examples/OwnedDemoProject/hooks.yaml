@@ -10,8 +10,17 @@ runtime:
   page_size: 16384
   dylib_name: "OwnedDemoHooks.dylib"
 app:
-  executable_member: "Payload/OwnedDemo.app/OwnedDemo"
+  prefer_unity_framework: true
   authorized_only: true
+build:
+  mode: development
+  menu: false
+  persistence: false
+analysis:
+  application_type: auto
+  rendering_backend: disabled
+  static_il2cpp: true
+  runtime_il2cpp: false
 config:
   flags:
     - { name: override_return_string, index: 0, default: false }
@@ -19,7 +28,11 @@ config:
   strings:
     - { name: return_string_value, index: 0, default: "runtime default string" }
   callbacks:
-    - { name: demo_callback, index: 0, symbol: IAOT_DemoCallback }
+    - name: demo_callback
+      index: 0
+      symbol: IAOT_DemoCallback
+      signature: "std::string()"
+      auto_register: true
 functions:
   - name: ReturningSomeString
     signature: "std::string()"
@@ -34,15 +47,22 @@ functions:
     kind: objc
     class: IAOTDemoGreeter
     selector: greetingText
+    class_method: false
+    signature: "id(id, SEL)"
+    replacement: IAOTGreeting
+    preserve_original: true
 generated_hooks:
   - { name: DemoStringHook, symbol: IAOT_InstallDemoStringHook }
-  - { name: DemoObjCHook, symbol: IAOT_InstallDemoObjCHook }
   - { name: DemoFunctionCaller, symbol: IAOT_InstallDemoFunctionCaller }
   - { name: UserHooks, symbol: IAOT_InstallUserHooks }
 patches:
   - name: DemoReturnStringPatch
     enabled: false
     description: "Example only; target must be an owned demo binary"
+    module: main
+    signature: "std::string()"
+    original_slot: 0
+    failure_behavior: disable_hook
     locator: { type: symbol, symbol: _DemoReturningSomeString }
     patch:
       type: branch_to_cave

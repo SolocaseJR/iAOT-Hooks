@@ -1,24 +1,32 @@
 use crate::{
     arm64,
     caves::{self, CaveRequest},
-    manifest::{Locator, Manifest, PatchAction},
+    manifest::{FailureBehavior, Locator, Manifest, Patch, PatchAction},
     pattern,
 };
 use object::{Object, ObjectSegment, ObjectSymbol};
-use std::{collections::HashMap, path::Path};
+use serde::Deserialize;
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    path::Path,
+};
 
 const MH_MAGIC_64: u32 = 0xfeedfacf;
 const CPU_TYPE_ARM64: u32 = 0x0100000c;
 const MH_EXECUTE: u32 = 2;
+const MH_DYLIB: u32 = 6;
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_CODE_SIGNATURE: u32 = 0x1d;
 const LC_LOAD_DYLIB: u32 = 0xc;
 const HEADER_SIZE: usize = 32;
 const SEGMENT_SIZE: usize = 72;
-const CONFIG_SIZE: usize = 9800;
+const CONFIG_SIZE: usize = 10312;
 const FLAGS_OFFSET: usize = 72;
 const CALLBACKS_OFFSET: usize = 1096;
 const STRINGS_OFFSET: usize = 1608;
+const ORIGINALS_OFFSET: usize = 9800;
+const ORIGINALS_COUNT: usize = 64;
 
 fn u32at(d: &[u8], o: usize) -> anyhow::Result<u32> {
     Ok(u32::from_le_bytes(
@@ -42,8 +50,11 @@ fn put32(d: &mut [u8], o: usize, v: u32) {
 fn put64(d: &mut [u8], o: usize, v: u64) {
     d[o..o + 8].copy_from_slice(&v.to_le_bytes())
 }
-fn align(v: u64, a: u64) -> u64 {
-    (v + a - 1) & !(a - 1)
+fn align(v: u64, a: u64) -> anyhow::Result<u64> {
+    let rounded = v
+        .checked_add(a - 1)
+        .ok_or_else(|| anyhow::anyhow!("alignment overflow"))?;
+    Ok(rounded & !(a - 1))
 }
 fn name16(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&x| x == 0).unwrap_or(bytes.len());
@@ -58,6 +69,13 @@ struct Segment {
     fileoff: u64,
     filesize: u64,
     initprot: u32,
+    sections: Vec<Section>,
+}
+#[derive(Clone, Debug)]
+struct Section {
+    name: String,
+    fileoff: usize,
+    size: usize,
 }
 #[derive(Debug)]
 struct Parsed {
@@ -70,9 +88,14 @@ fn parse(data: &[u8]) -> anyhow::Result<Parsed> {
     if data.len() < HEADER_SIZE
         || u32at(data, 0)? != MH_MAGIC_64
         || u32at(data, 4)? != CPU_TYPE_ARM64
-        || u32at(data, 12)? != MH_EXECUTE
+        || !matches!(u32at(data, 12)?, MH_EXECUTE | MH_DYLIB)
     {
-        anyhow::bail!("input must be a thin ARM64 MH_EXECUTE Mach-O")
+        anyhow::bail!("input must be a thin ARM64 executable or dylib Mach-O")
+    }
+    if u32at(data, 8)? & 0x00ff_ffff == 2 {
+        anyhow::bail!(
+            "arm64e static callback-pointer bridges are not supported; provide a plain arm64 slice"
+        )
     }
     let ncmds = u32at(data, 16)?;
     let sizeofcmds = u32at(data, 20)?;
@@ -105,6 +128,17 @@ fn parse(data: &[u8]) -> anyhow::Result<Parsed> {
             if SEGMENT_SIZE + nsects * 80 > size {
                 anyhow::bail!("segment sections exceed command")
             };
+            let mut sections = Vec::new();
+            for i in 0..nsects {
+                let section = p + SEGMENT_SIZE + i * 80;
+                let offset = u32at(data, section + 48)? as usize;
+                let size = u64at(data, section + 40)? as usize;
+                sections.push(Section {
+                    name: name16(&data[section..section + 16]),
+                    fileoff: offset,
+                    size,
+                });
+            }
             let segment = Segment {
                 name: name16(&data[p + 8..p + 24]),
                 vmaddr: u64at(data, p + 24)?,
@@ -112,7 +146,29 @@ fn parse(data: &[u8]) -> anyhow::Result<Parsed> {
                 fileoff: u64at(data, p + 40)?,
                 filesize: u64at(data, p + 48)?,
                 initprot: u32at(data, p + 60)?,
+                sections,
             };
+            segment
+                .vmaddr
+                .checked_add(segment.vmsize)
+                .ok_or_else(|| anyhow::anyhow!("segment VM range overflow"))?;
+            let file_end = segment
+                .fileoff
+                .checked_add(segment.filesize)
+                .ok_or_else(|| anyhow::anyhow!("segment file range overflow"))?;
+            if file_end > data.len() as u64 {
+                anyhow::bail!("segment file range exceeds the Mach-O")
+            }
+            for section in &segment.sections {
+                if section.fileoff > 0
+                    && section
+                        .fileoff
+                        .checked_add(section.size)
+                        .is_none_or(|end| end > data.len())
+                {
+                    anyhow::bail!("section file range exceeds the Mach-O")
+                }
+            }
             for i in 0..nsects {
                 let off = u32at(data, p + SEGMENT_SIZE + i * 80 + 48)? as usize;
                 if off > 0 {
@@ -168,15 +224,15 @@ fn segment_command(
     put32(&mut c, 60, prot);
     c
 }
-fn dylib_command(name: &str) -> Vec<u8> {
+fn dylib_command(name: &str) -> anyhow::Result<Vec<u8>> {
     let path = format!("@executable_path/Frameworks/{name}");
-    let size = align((24 + path.len() + 1) as u64, 8) as usize;
+    let size = align((24 + path.len() + 1) as u64, 8)? as usize;
     let mut command = vec![0u8; size];
     put32(&mut command, 0, LC_LOAD_DYLIB);
     put32(&mut command, 4, size as u32);
     put32(&mut command, 8, 24);
     command[24..24 + path.len()].copy_from_slice(path.as_bytes());
-    command
+    Ok(command)
 }
 fn load_command_name(command: &[u8]) -> Option<&str> {
     if command.len() < 24 {
@@ -244,10 +300,59 @@ fn choose(mut hits: Vec<usize>, index: Option<usize>, label: &str) -> anyhow::Re
         ),
     }
 }
-fn pattern_hits(data: &[u8], parsed: &Parsed, text: &str) -> anyhow::Result<Vec<usize>> {
+fn pattern_hits(
+    data: &[u8],
+    parsed: &Parsed,
+    text: &str,
+    segment_name: Option<&str>,
+    section_name: Option<&str>,
+) -> anyhow::Result<Vec<usize>> {
     let alternatives = pattern::parse(text)?;
     let mut hits = Vec::new();
-    for range in executable_ranges(parsed, data.len()) {
+    let ranges = if let Some(section_name) = section_name {
+        let mut ranges = Vec::new();
+        for segment in parsed
+            .segments
+            .iter()
+            .filter(|segment| segment.initprot & 4 != 0)
+            .filter(|segment| segment_name.is_none_or(|name| segment.name == name))
+        {
+            for section in segment
+                .sections
+                .iter()
+                .filter(|section| section.name == section_name)
+            {
+                let end = section.fileoff.saturating_add(section.size).min(data.len());
+                if section.fileoff < end {
+                    ranges.push(section.fileoff..end);
+                }
+            }
+        }
+        if ranges.is_empty() {
+            anyhow::bail!("no executable section matched {section_name}")
+        }
+        ranges
+    } else if let Some(segment_name) = segment_name {
+        let ranges = parsed
+            .segments
+            .iter()
+            .filter(|segment| segment.name == segment_name && segment.initprot & 4 != 0)
+            .filter_map(|segment| {
+                let start = segment.fileoff as usize;
+                let end = start
+                    .saturating_add(segment.filesize as usize)
+                    .min(data.len());
+                (start < end).then_some(start..end)
+            })
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            anyhow::bail!("no executable segment matched {segment_name}")
+        }
+        ranges
+    } else {
+        executable_ranges(parsed, data.len())
+    };
+    for range in ranges {
         for p in &alternatives {
             for local in pattern::find(&data[range.clone()], p) {
                 let off = range.start + local;
@@ -274,18 +379,119 @@ fn symbol_address(data: &[u8], name: &str) -> anyhow::Result<u64> {
     }
     Ok(found[0])
 }
+#[derive(Debug, Deserialize)]
+struct Il2CppMethodMap {
+    #[serde(default)]
+    methods: Vec<Il2CppMethodEntry>,
+}
+#[derive(Debug, Deserialize)]
+struct Il2CppMethodEntry {
+    id: Option<String>,
+    assembly: String,
+    namespace: String,
+    class: String,
+    method: String,
+    parameter_count: Option<u32>,
+    module: Option<String>,
+    rva: Option<u64>,
+    vmaddr: Option<u64>,
+}
+fn resolve_il2cpp_locator(
+    manifest: &Manifest,
+    patch: &Patch,
+    locator: &Locator,
+    parsed: &Parsed,
+) -> anyhow::Result<u64> {
+    let Locator::Il2cpp {
+        assembly,
+        namespace,
+        class,
+        method,
+        parameter_count,
+        method_id,
+        rva,
+        manifest: map_path,
+    } = locator
+    else {
+        anyhow::bail!("internal error: non-IL2CPP locator passed to IL2CPP resolver")
+    };
+    if let Some(rva) = rva {
+        return Ok(image_base(parsed)? + *rva);
+    }
+    let configured = map_path
+        .as_ref()
+        .or(manifest.analysis.il2cpp_method_manifest.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!("IL2CPP locator needs rva or analysis.il2cpp_method_manifest")
+        })?;
+    let path = if configured.is_absolute() {
+        configured.clone()
+    } else {
+        manifest.source_dir.join(configured)
+    };
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot read IL2CPP method manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    let map: Il2CppMethodMap = serde_yaml::from_str(&text)?;
+    let mut matches = map
+        .methods
+        .iter()
+        .filter(|entry| {
+            let identity = method_id
+                .as_deref()
+                .is_some_and(|id| entry.id.as_deref() == Some(id))
+                || (method_id.is_none()
+                    && entry.assembly == assembly.as_str()
+                    && entry.namespace == namespace.as_str()
+                    && entry.class == class.as_str()
+                    && entry.method == method.as_str()
+                    && parameter_count.is_none_or(|count| entry.parameter_count == Some(count)));
+            identity
+                && patch.module.as_deref().is_none_or(|module| {
+                    entry.module.as_deref().is_none_or(|value| value == module)
+                })
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        anyhow::bail!(
+            "IL2CPP method resolved to {} entries in {}",
+            matches.len(),
+            path.display()
+        )
+    }
+    let entry = matches.remove(0);
+    match (entry.vmaddr, entry.rva) {
+        (Some(value), None) => Ok(value),
+        (None, Some(value)) => Ok(image_base(parsed)? + value),
+        _ => anyhow::bail!("IL2CPP method entry must contain exactly one of rva or vmaddr"),
+    }
+}
 fn locate(
     data: &[u8],
     parsed: &Parsed,
-    locator: &Locator,
-    label: &str,
+    manifest: &Manifest,
+    patch: &Patch,
 ) -> anyhow::Result<(usize, u64)> {
+    let locator = &patch.locator;
+    let label = &patch.name;
     let off = match locator {
         Locator::Pattern {
             pattern,
             match_index,
-        } => choose(pattern_hits(data, parsed, pattern)?, *match_index, label)?,
-        Locator::Symbol { symbol } => vm_to_file(parsed, symbol_address(data, symbol)?)?,
+            expected_matches,
+            segment,
+            section,
+        } => {
+            let hits = pattern_hits(data, parsed, pattern, segment.as_deref(), section.as_deref())?;
+            if expected_matches.is_some_and(|count| hits.len() != count) {
+                anyhow::bail!("{label}: expected {expected_matches:?} pattern matches, found {}", hits.len())
+            }
+            choose(hits, *match_index, label)?
+        }
+        Locator::Symbol { symbol } | Locator::Export { symbol } => vm_to_file(parsed, symbol_address(data, symbol)?)?,
         Locator::Va { value } | Locator::Vmaddr { value } => vm_to_file(parsed, *value)?,
         Locator::Rva { value } => vm_to_file(parsed, image_base(parsed)? + value)?,
         Locator::Xref {
@@ -295,11 +501,11 @@ fn locate(
             xref_match_index,
             xref_bl_index,
         } => {
-            let targets = pattern_hits(data, parsed, pattern)?;
+            let targets = pattern_hits(data, parsed, pattern, None, None)?;
             if let Some(xpat) = xref_pattern {
                 let target_off = choose(targets, *match_index, &format!("{label} target pattern"))?;
                 let target_vm = file_to_vm(parsed, target_off)?;
-                let calls = pattern_hits(data, parsed, xpat)?
+                let calls = pattern_hits(data, parsed, xpat, None, None)?
                     .into_iter()
                     .filter(|off| {
                         let pos = *off + xref_bl_index.unwrap_or(0) * 4;
@@ -324,24 +530,22 @@ fn locate(
                 vm_to_file(parsed, target)?
             }
         }
+        Locator::Il2cpp { .. } => {
+            vm_to_file(parsed, resolve_il2cpp_locator(manifest, patch, locator, parsed)?)?
+        }
+        Locator::Custom { resolver, value } => anyhow::bail!(
+            "{label}: custom resolver '{resolver}' ({value}) needs an offline adapter; arbitrary resolver code is not executed"
+        ),
     };
     if off % 4 != 0 {
         anyhow::bail!("{label}: resolved target is unaligned")
     }
     Ok((off, file_to_vm(parsed, off)?))
 }
-fn pc_relative(i: u32) -> bool {
-    (i & 0x7c00_0000) == 0x1400_0000
-        || (i & 0x1f00_0000) == 0x1000_0000
-        || (i & 0xff00_0010) == 0x5400_0000
-        || (i & 0x7e00_0000) == 0x3400_0000
-        || (i & 0x7e00_0000) == 0x3600_0000
-        || (i & 0x3b00_0000) == 0x1800_0000
-}
 fn config_bytes(m: &Manifest) -> Vec<u8> {
     let mut c = vec![0u8; CONFIG_SIZE];
     c[..8].copy_from_slice(b"IAOTCFG1");
-    put32(&mut c, 8, 1);
+    put32(&mut c, 8, 2);
     put32(&mut c, 12, CONFIG_SIZE as u32);
     put32(&mut c, 16, FLAGS_OFFSET as u32);
     put32(&mut c, 20, 256);
@@ -349,6 +553,8 @@ fn config_bytes(m: &Manifest) -> Vec<u8> {
     put32(&mut c, 28, 64);
     put32(&mut c, 32, STRINGS_OFFSET as u32);
     put32(&mut c, 36, 32);
+    put32(&mut c, 40, ORIGINALS_OFFSET as u32);
+    put32(&mut c, 44, ORIGINALS_COUNT as u32);
     for f in &m.config.flags {
         put32(
             &mut c,
@@ -380,6 +586,7 @@ pub struct PatchReport {
     pub removed_code_signatures: usize,
     pub added_dylib_load_command: bool,
     pub resolutions: Vec<PatchResolution>,
+    pub failures: Vec<PatchFailure>,
 }
 #[derive(Debug)]
 pub struct PatchResolution {
@@ -387,6 +594,12 @@ pub struct PatchResolution {
     pub vmaddr: u64,
     pub bytes: [u8; 4],
     pub automatic: bool,
+    pub original_vmaddr: Option<u64>,
+}
+#[derive(Debug)]
+pub struct PatchFailure {
+    pub name: String,
+    pub reason: String,
 }
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PatchOptions {
@@ -413,9 +626,14 @@ pub fn patch_with_options(
         .map(|s| s.vmaddr + s.vmsize)
         .max()
         .ok_or_else(|| anyhow::anyhow!("no segments"))?;
-    let config_vm = align(max_vm, page);
-    let config = config_bytes(m);
-    let cave_vm = align(config_vm + config.len() as u64, page);
+    let config_vm = align(max_vm, page)?;
+    let mut config = config_bytes(m);
+    let cave_vm = align(
+        config_vm
+            .checked_add(config.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("config VM range overflow"))?,
+        page,
+    )?;
     let flags: HashMap<_, _> = m
         .config
         .flags
@@ -430,71 +648,134 @@ pub fn patch_with_options(
         .collect();
     let mut targets = Vec::new();
     let mut resolutions = Vec::new();
+    let mut failures = Vec::new();
+    let mut target_offsets = HashSet::new();
     for p in m.patches.iter().filter(|p| p.enabled) {
-        let (off, vm) = locate(&original, &parsed, &p.locator, &p.name)?;
-        let bytes: [u8; 4] = original[off..off + 4].try_into().unwrap();
-        if let Some(expect) = &p.expect {
-            if expect != "auto" && bytes != expected_bytes(expect)? {
-                anyhow::bail!("{}: expected bytes do not match", p.name)
+        let resolved = (|| -> anyhow::Result<_> {
+            let (off, vm) = locate(&original, &parsed, m, p)?;
+            let bytes: [u8; 4] = original
+                .get(off..off + 4)
+                .ok_or_else(|| anyhow::anyhow!("resolved instruction is truncated"))?
+                .try_into()
+                .unwrap();
+            if let Some(expect) = &p.expect {
+                if expect != "auto" && bytes != expected_bytes(expect)? {
+                    anyhow::bail!("expected bytes do not match")
+                }
             }
+            if !target_offsets.insert(off) {
+                anyhow::bail!("another enabled patch already targets file offset 0x{off:x}")
+            }
+            Ok((off, vm, bytes, u32::from_le_bytes(bytes)))
+        })();
+        let (off, vm, bytes, displaced) = match resolved {
+            Ok(value) => value,
+            Err(error) if p.failure_behavior == FailureBehavior::DisableHook => {
+                failures.push(PatchFailure {
+                    name: p.name.clone(),
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+            Err(error) => return Err(error.context(format!("patch {} resolution failed", p.name))),
+        };
+        targets.push((p, off, vm, bytes, displaced));
+    }
+    let mut cave = Vec::new();
+    let mut redirects = Vec::new();
+    for (p, off, vm, displaced_bytes, displaced) in targets {
+        while cave.len() % 4 != 0 {
+            cave.push(0)
+        }
+        let start = cave_vm
+            .checked_add(cave.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("code-cave VM range overflow"))?;
+        let built = (|| -> anyhow::Result<(Vec<u8>, u64, Option<u64>)> {
+            let mut local = Vec::new();
+            let original_vm = if p.original_slot.is_some() {
+                let address = start;
+                local.extend_from_slice(&caves::build_original_trampoline(address, vm, displaced)?);
+                while local.len() % 4 != 0 {
+                    local.push(0)
+                }
+                Some(address)
+            } else {
+                None
+            };
+            let address = start + local.len() as u64;
+            let (flag, callback, replacement) = match &p.patch.action {
+                PatchAction::RetIfFlag { flag } | PatchAction::ZeroRegisterIfFlag { flag, .. } => {
+                    (Some(flags[flag.as_str()]), None, None)
+                }
+                PatchAction::CallbackIfFlag { flag, callback }
+                | PatchAction::CallbackReturnZeroIfFlag { flag, callback } => (
+                    Some(flags[flag.as_str()]),
+                    Some(callbacks[callback.as_str()]),
+                    None,
+                ),
+                PatchAction::CallbackAfter { callback }
+                | PatchAction::BranchToCallback { callback } => {
+                    (None, Some(callbacks[callback.as_str()]), None)
+                }
+                PatchAction::BranchToReplacement { symbol } => {
+                    (None, None, Some(symbol_address(&original, symbol)?))
+                }
+            };
+            let bridge = caves::build(&CaveRequest {
+                action: &p.patch.action,
+                cave_address: address,
+                return_address: vm + 4,
+                original_address: vm,
+                displaced,
+                config_address: config_vm,
+                flag_index: flag,
+                callback_index: callback,
+                replacement_address: replacement,
+            })?;
+            arm64::b(vm, address)?;
+            local.extend_from_slice(&bridge);
+            Ok((local, address, original_vm))
+        })();
+        let (bytes, bridge_address, original_vm) = match built {
+            Ok(value) => value,
+            Err(error) if p.failure_behavior == FailureBehavior::DisableHook => {
+                failures.push(PatchFailure {
+                    name: p.name.clone(),
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+            Err(error) => {
+                return Err(error.context(format!("patch {} bridge generation failed", p.name)))
+            }
+        };
+        if let (Some(slot), Some(original_vm)) = (p.original_slot, original_vm) {
+            put64(
+                &mut config,
+                ORIGINALS_OFFSET + slot as usize * 8,
+                original_vm,
+            );
         }
         resolutions.push(PatchResolution {
             name: p.name.clone(),
             vmaddr: vm,
-            bytes,
+            bytes: displaced_bytes,
             automatic: p.expect.as_deref().is_none_or(|x| x == "auto"),
+            original_vmaddr: original_vm,
         });
-        let displaced = u32::from_le_bytes(bytes);
-        if !matches!(p.patch.action, PatchAction::BranchToReplacement { .. })
-            && pc_relative(displaced)
-        {
-            anyhow::bail!("{}: refusing to displace a PC-relative instruction", p.name)
-        }
-        targets.push((p, off, vm, displaced));
-    }
-    let mut cave = Vec::new();
-    let mut redirects = Vec::new();
-    for (p, off, vm, displaced) in targets {
-        while cave.len() % 4 != 0 {
-            cave.push(0)
-        }
-        let addr = cave_vm + cave.len() as u64;
-        let (flag, callback, replacement) = match &p.patch.action {
-            PatchAction::RetIfFlag { flag } | PatchAction::ZeroRegisterIfFlag { flag, .. } => {
-                (Some(flags[flag.as_str()]), None, None)
-            }
-            PatchAction::CallbackIfFlag { flag, callback }
-            | PatchAction::CallbackReturnZeroIfFlag { flag, callback } => (
-                Some(flags[flag.as_str()]),
-                Some(callbacks[callback.as_str()]),
-                None,
-            ),
-            PatchAction::CallbackAfter { callback }
-            | PatchAction::BranchToCallback { callback } => {
-                (None, Some(callbacks[callback.as_str()]), None)
-            }
-            PatchAction::BranchToReplacement { symbol } => {
-                (None, None, Some(symbol_address(&original, symbol)?))
-            }
-        };
-        let built = caves::build(&CaveRequest {
-            action: &p.patch.action,
-            cave_address: addr,
-            return_address: vm + 4,
-            displaced,
-            config_address: config_vm,
-            flag_index: flag,
-            callback_index: callback,
-            replacement_address: replacement,
-        })?;
-        cave.extend_from_slice(&built);
-        redirects.push((off, vm, addr));
+        cave.extend_from_slice(&bytes);
+        redirects.push((off, vm, bridge_address));
     }
     if cave.is_empty() {
         cave.extend_from_slice(&arm64::ret().to_le_bytes())
     }
-    let config_file = align(original.len() as u64, page);
-    let cave_file = align(config_file + config.len() as u64, page);
+    let config_file = align(original.len() as u64, page)?;
+    let cave_file = align(
+        config_file
+            .checked_add(config.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("config file range overflow"))?,
+        page,
+    )?;
     let mut commands = Vec::new();
     let mut kept = 0u32;
     let dylib_path = format!("@executable_path/Frameworks/{}", m.runtime.dylib_name);
@@ -509,13 +790,13 @@ pub fn patch_with_options(
     }
     let added_dylib_load_command = options.load_dylib && !already_loads_dylib;
     if added_dylib_load_command {
-        commands.extend_from_slice(&dylib_command(&m.runtime.dylib_name));
+        commands.extend_from_slice(&dylib_command(&m.runtime.dylib_name)?);
         kept += 1;
     }
     commands.extend_from_slice(&segment_command(
         &m.runtime.config_segment,
         config_vm,
-        align(config.len() as u64, page),
+        align(config.len() as u64, page)?,
         config_file,
         config.len() as u64,
         3,
@@ -523,7 +804,7 @@ pub fn patch_with_options(
     commands.extend_from_slice(&segment_command(
         &m.runtime.cave_segment,
         cave_vm,
-        align(cave.len() as u64, page),
+        align(cave.len() as u64, page)?,
         cave_file,
         cave.len() as u64,
         5,
@@ -551,10 +832,13 @@ pub fn patch_with_options(
         out[*off..*off + 4].copy_from_slice(&arm64::b(*vm, *target)?.to_le_bytes())
     }
     verify_data(&out, m, Some(&redirects))?;
-    std::fs::write(output, &out)?;
-    let reopened = std::fs::read(output)?;
+    let output_parent = output.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(output_parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(output_parent)?;
+    temporary.write_all(&out)?;
+    temporary.as_file_mut().sync_all()?;
+    let reopened = std::fs::read(temporary.path())?;
     if let Err(error) = verify_data(&reopened, m, Some(&redirects)) {
-        let _ = std::fs::remove_file(output);
         return Err(error.context("reopened output verification failed"));
     }
     if options.load_dylib {
@@ -562,10 +846,10 @@ pub fn patch_with_options(
         if !reopened_parsed.commands.iter().any(|(cmd, bytes)| {
             *cmd == LC_LOAD_DYLIB && load_command_name(bytes) == Some(dylib_path.as_str())
         }) {
-            let _ = std::fs::remove_file(output);
             anyhow::bail!("reopened output is missing the requested dylib load command")
         }
     }
+    temporary.persist(output).map_err(|error| error.error)?;
     Ok(PatchReport {
         patches: redirects.len(),
         config_vmaddr: config_vm,
@@ -573,6 +857,7 @@ pub fn patch_with_options(
         removed_code_signatures: parsed.signature_blobs.len(),
         added_dylib_load_command,
         resolutions,
+        failures,
     })
 }
 
@@ -596,8 +881,10 @@ fn verify_data(
         || cave.initprot != 5
         || cfg.fileoff as usize + CONFIG_SIZE > data.len()
         || &data[cfg.fileoff as usize..cfg.fileoff as usize + 8] != b"IAOTCFG1"
-        || u32at(data, cfg.fileoff as usize + 8)? != 1
+        || u32at(data, cfg.fileoff as usize + 8)? != 2
         || u32at(data, cfg.fileoff as usize + 12)? as usize != CONFIG_SIZE
+        || u32at(data, cfg.fileoff as usize + 40)? as usize != ORIGINALS_OFFSET
+        || u32at(data, cfg.fileoff as usize + 44)? as usize != ORIGINALS_COUNT
     {
         anyhow::bail!("IAOT segment protection or config layout verification failed")
     }
@@ -647,14 +934,24 @@ pub fn verify(path: &Path) -> anyhow::Result<()> {
         if segment.filesize as usize >= CONFIG_SIZE
             && data.get(start..start + 8) == Some(b"IAOTCFG1")
             && (segment.initprot != 3
-                || u32at(&data, start + 8)? != 1
+                || u32at(&data, start + 8)? != 2
                 || u32at(&data, start + 12)? as usize != CONFIG_SIZE
                 || u32at(&data, start + 16)? as usize != FLAGS_OFFSET
                 || u32at(&data, start + 24)? as usize != CALLBACKS_OFFSET
-                || u32at(&data, start + 32)? as usize != STRINGS_OFFSET)
+                || u32at(&data, start + 32)? as usize != STRINGS_OFFSET
+                || u32at(&data, start + 40)? as usize != ORIGINALS_OFFSET
+                || u32at(&data, start + 44)? as usize != ORIGINALS_COUNT)
         {
             anyhow::bail!("invalid IAOT runtime config layout")
         }
+    }
+    Ok(())
+}
+pub fn verify_dylib(path: &Path) -> anyhow::Result<()> {
+    let data = std::fs::read(path)?;
+    parse(&data)?;
+    if u32at(&data, 12)? != MH_DYLIB {
+        anyhow::bail!("runtime artifact is not an MH_DYLIB Mach-O")
     }
     Ok(())
 }
@@ -756,17 +1053,26 @@ mod tests {
         assert!(!output.exists());
     }
     #[test]
-    fn refuses_pc_relative_displacement() {
+    fn rejects_overflowing_segment_ranges() {
+        let mut data = fixture(0x400, 0xd503201f);
+        put64(&mut data, HEADER_SIZE + 24, u64::MAX - 0x1000);
+        put64(&mut data, HEADER_SIZE + 32, 0x4000);
+        assert!(parse(&data)
+            .unwrap_err()
+            .to_string()
+            .contains("segment VM range overflow"));
+    }
+    #[test]
+    fn relocates_supported_pc_relative_displacement() {
         let dir = tempdir().unwrap();
         let input = dir.path().join("in");
         let output = dir.path().join("out");
         std::fs::write(&input, fixture(0x400, 0x14000001)).unwrap();
         let mut m = manifest();
         m.patches[0].expect = Some("01 00 00 14".into());
-        assert!(patch(&m, &input, &output)
-            .unwrap_err()
-            .to_string()
-            .contains("PC-relative"));
+        let report = patch(&m, &input, &output).unwrap();
+        assert_eq!(report.patches, 1);
+        assert!(output.is_file());
     }
     #[test]
     fn resolves_bytes_and_adds_dylib_command() {
@@ -787,5 +1093,21 @@ mod tests {
             .iter()
             .any(|(cmd, bytes)| *cmd == LC_LOAD_DYLIB
                 && load_command_name(bytes) == Some("@executable_path/Frameworks/Demo.dylib")));
+    }
+    #[test]
+    fn isolated_bridge_failure_is_not_reported_as_applied() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("in");
+        let output = dir.path().join("out");
+        std::fs::write(&input, fixture(0x400, 0xd503201f)).unwrap();
+        let mut m = manifest();
+        m.patches[0].failure_behavior = FailureBehavior::DisableHook;
+        m.patches[0].patch.action = PatchAction::BranchToReplacement {
+            symbol: "_MissingOwnedSymbol".into(),
+        };
+        let report = patch(&m, &input, &output).unwrap();
+        assert_eq!(report.patches, 0);
+        assert!(report.resolutions.is_empty());
+        assert_eq!(report.failures.len(), 1);
     }
 }

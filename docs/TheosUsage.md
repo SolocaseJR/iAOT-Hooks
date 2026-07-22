@@ -1,9 +1,7 @@
-# Theos Usage
+# Theos Runtime Build
 
-The template compiles `runtime/src`, generated glue, and hook `.cpp`/`.mm` files into one arm64 dylib with C++17. Use `.mm` for Foundation, UIKit, Objective-C runtime, dyld, or Mach-O APIs; keep portable logic in `.cpp`.
+The template compiles all `runtime/src/*.cpp`/`.mm`, generated registration, and `user/*.mm` into one ARM64 dylib. Objective-C++ uses ARC; C++ uses C++17. `runtime/overlay/IAOTOverlay.mk` conditionally adds Dear ImGui and Metal frameworks.
 
-Run `iaot generate hooks.yaml`, add new user files to `<Library>_FILES`, then run `make`. Include `runtime/include` and `generated`, enable ARC for Objective-C++, and retain `-ObjC`.
+Run `iaot prepare` before Make so detected IL2CPP/module/renderer data reaches generated code. On Linux/WSL, `iaot pipeline --build-runtime` runs Make. On Windows, use `scripts/build-iaot.ps1`; it stages source into WSL, supplies the correct `IAOT_ROOT`, and copies the dylib back.
 
-Generated registration is preferred to static auto-registration because linkers can omit unreferenced objects. The optional `IAOT_REGISTER_HOOK` macro exists but is less reliable with archives/dead stripping.
-
-Theos only builds the dylib. On jailed iOS, embed it in an app you own or may test, arrange authorized loading, and sign/re-sign the whole package. IAOT is not a tweak-loader workflow.
+Theos only compiles. IPA injection, validation, and signing are separate pipeline/external stages.

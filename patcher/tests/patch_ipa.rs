@@ -12,11 +12,11 @@ fn put32(data: &mut [u8], offset: usize, value: u32) {
 fn put64(data: &mut [u8], offset: usize, value: u64) {
     data[offset..offset + 8].copy_from_slice(&value.to_le_bytes())
 }
-fn macho_fixture() -> Vec<u8> {
+fn macho_fixture(filetype: u32) -> Vec<u8> {
     let mut d = vec![0u8; 0x1000];
     put32(&mut d, 0, 0xfeedfacf);
     put32(&mut d, 4, 0x0100000c);
-    put32(&mut d, 12, 2);
+    put32(&mut d, 12, filetype);
     put32(&mut d, 16, 2);
     put32(&mut d, 20, 168);
     let p = 32;
@@ -57,13 +57,19 @@ fn patches_complete_ipa_and_stages_dylib() {
         SimpleFileOptions::default().unix_permissions(0o755),
     )
     .unwrap();
-    zip.write_all(&macho_fixture()).unwrap();
+    zip.write_all(b"main-executable").unwrap();
+    zip.start_file(
+        "Payload/Demo.app/Frameworks/UnityFramework.framework/UnityFramework",
+        SimpleFileOptions::default().unix_permissions(0o755),
+    )
+    .unwrap();
+    zip.write_all(&macho_fixture(6)).unwrap();
     zip.start_file("Payload/Demo.app/Info.plist", SimpleFileOptions::default())
         .unwrap();
     zip.write_all(b"plist").unwrap();
     zip.finish().unwrap();
     std::fs::write(&dylib, b"signed-demo-dylib").unwrap();
-    std::fs::write(&manifest,"project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: { executable_member: Payload/Demo.app/Demo, authorized_only: true }\nconfig:\n  flags: [{ name: enabled, index: 0, default: true }]\n  strings: []\n  callbacks: []\nfunctions: []\ngenerated_hooks: []\npatches:\n  - name: auto_bytes\n    enabled: true\n    description: synthetic owned fixture\n    locator: { type: va, value: 0x100000400 }\n    patch: { type: branch_to_cave, action: { type: ret_if_flag, flag: enabled } }\n    expect: auto\n").unwrap();
+    std::fs::write(&manifest,"project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: { executable_member: Payload/Demo.app/Demo, authorized_only: true, prefer_unity_framework: true }\nconfig:\n  flags: [{ name: enabled, index: 0, default: true }]\n  strings: []\n  callbacks: []\nfunctions: []\ngenerated_hooks: []\npatches:\n  - name: auto_bytes\n    enabled: true\n    description: synthetic owned fixture\n    locator: { type: va, value: 0x100000400 }\n    patch: { type: branch_to_cave, action: { type: ret_if_flag, flag: enabled } }\n    expect: auto\n").unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_iaot"))
         .args([
             "patch-ipa",
@@ -85,10 +91,11 @@ fn patches_complete_ipa_and_stages_dylib() {
     );
     let stdout = String::from_utf8_lossy(&result.stdout);
     assert!(stdout.contains("resolved automatically"));
+    assert!(stdout.contains("UnityFramework.framework/UnityFramework"));
     let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
     let mut executable = Vec::new();
     archive
-        .by_name("Payload/Demo.app/Demo")
+        .by_name("Payload/Demo.app/Frameworks/UnityFramework.framework/UnityFramework")
         .unwrap()
         .read_to_end(&mut executable)
         .unwrap();

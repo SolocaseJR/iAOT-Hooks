@@ -11,6 +11,7 @@ CompileFlags:
     - -Iruntime/include
     - -Itemplates/theos-dylib/generated
     - -Iexamples/OwnedDemoProject/generated
+    - -Ivendor/imgui
     - -I.
   Remove:
     - -arch

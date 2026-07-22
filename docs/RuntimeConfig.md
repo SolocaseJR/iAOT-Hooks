@@ -1,7 +1,7 @@
-# Runtime Config
+# Runtime Config ABI
 
-`RuntimeConfigHeader` stores `IAOTCFG1`, version, total size, and offset/count pairs for flags, callbacks, and strings, plus reserved fields. Static assertions lock the 64-bit header, array offsets, and total size.
+Version 2 uses magic `IAOTCFG1`, a 72-byte header, 256 32-bit flag cells, 64 callback pointers, 32 fixed 256-byte strings, and 64 original-trampoline pointers. The 64-bit total is 10,312 bytes; static assertions and Rust verification lock every offset.
 
-Flags are 32-bit cells. `I32`, `U32`, `Bool`, and `F32` use one cell; `U64` uses two adjacent cells. Strings are 32 fixed 256-byte buffers and are always NUL-terminated. Callbacks are 64 pointer-sized slots and must point only to compatible precompiled signed functions.
+Scalar flag/callback access uses atomic compiler builtins. Compound 64-bit/string operations use a small runtime lock; string reads return a thread-local copy. When multiple modules are patched, setters mirror data to every valid config. Original lookup searches configs for the unique nonzero slot.
 
-Raw Mach-O storage cannot contain `std::string`, `std::vector`, or `std::map`: those contain process-specific pointers/allocator state and are not a stable binary layout. Accessors validate the header and bounds, return false/zero/empty string for unavailable data, and ignore invalid writes.
+Only fixed-layout values belong in Mach-O data. `std::string`, containers, and allocator-owned objects are prohibited.

@@ -1,3 +1,4 @@
+mod analyzer;
 mod arm64;
 mod caves;
 mod errors;
@@ -6,6 +7,7 @@ mod ipa;
 mod macho;
 mod manifest;
 mod pattern;
+mod pipeline;
 mod verify;
 use clap::{Parser, Subcommand};
 use std::{
@@ -37,6 +39,36 @@ enum Cmd {
         manifest: PathBuf,
         #[arg(long)]
         force_authorized: bool,
+    },
+    AnalyzeIpa {
+        #[arg(long = "in")]
+        input: PathBuf,
+        #[arg(long)]
+        reports: Option<PathBuf>,
+    },
+    Prepare {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long = "in")]
+        input: PathBuf,
+        #[arg(long)]
+        reports: PathBuf,
+    },
+    Pipeline {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long = "in")]
+        input: Option<PathBuf>,
+        #[arg(long = "out")]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        dylib: Option<PathBuf>,
+        #[arg(long)]
+        build_runtime: bool,
+        #[arg(long)]
+        reports: Option<PathBuf>,
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
     },
     Build,
     PatchMacho {
@@ -106,6 +138,12 @@ fn print_patch_report(report: &macho::PatchReport) {
                 ""
             }
         );
+        if let Some(original) = resolution.original_vmaddr {
+            println!("  callable original trampoline: 0x{original:x}");
+        }
+    }
+    for failure in &report.failures {
+        println!("{}: disabled safely: {}", failure.name, failure.reason);
     }
     println!("patched {} authorized redirect(s); config=0x{:x}, caves=0x{:x}, removed {} stale code signature command(s){}",report.patches,report.config_vmaddr,report.cave_vmaddr,report.removed_code_signatures,if report.added_dylib_load_command{"; added embedded-dylib load command"}else{""});
 }
@@ -120,15 +158,35 @@ fn new_project(name: &str) -> anyhow::Result<()> {
     if d.exists() {
         anyhow::bail!("destination already exists")
     }
-    fs::create_dir_all(d.join("hooks"))?;
+    fs::create_dir_all(d.join("user"))?;
     let manifest_path = d.join("hooks.yaml");
-    fs::write(&manifest_path,format!("project:\n  name: {name}\n  bundle_id: com.example.owned.demo\n  platform: ios\n  arch: arm64\n  min_ios: \"14.0\"\nruntime:\n  config_segment: \"__IAOTCFG\"\n  cave_segment: \"__IAOTCAVE\"\n  page_size: 16384\n  dylib_name: \"{name}.dylib\"\napp:\n  executable_member: \"Payload/OwnedDemo.app/OwnedDemo\"\n  authorized_only: true\nconfig: {{ flags: [], strings: [], callbacks: [] }}\nfunctions: []\ngenerated_hooks:\n  - {{ name: UserHooks, symbol: IAOT_InstallUserHooks }}\npatches: []\n"))?;
+    let template_manifest = include_str!("../../templates/theos-dylib/hooks.yaml")
+        .replace("ExampleHooks", name)
+        .replace(
+            "com.example.authorized.target",
+            &format!("com.example.{}.target", name.to_ascii_lowercase()),
+        );
+    fs::write(&manifest_path, template_manifest)?;
     fs::write(
         d.join("README.md"),
         "Authorized IAOT project. Compile all native behavior before signing.\n",
     )?;
-    fs::write(d.join("hooks/UserHooks.mm"),"#include <IAOT/IAOT.hpp>\n// Put authorized app-specific hook installs here.\nextern \"C\" bool IAOT_InstallUserHooks(const iaot::HookContext& ctx){IAOT_UNUSED(ctx);return true;}\n")?;
-    fs::write(d.join("Makefile"),format!("TARGET := iphone:clang:latest:14.0\nARCHS := arm64\nIAOT_ROOT ?= ..\ninclude $(THEOS)/makefiles/common.mk\nLIBRARY_NAME := {name}\n{name}_FILES += $(wildcard $(IAOT_ROOT)/runtime/src/*.cpp) $(wildcard $(IAOT_ROOT)/runtime/src/*.mm) generated/IAOTGeneratedHooks.mm hooks/UserHooks.mm\n{name}_CCFLAGS += -std=c++17 -I$(IAOT_ROOT)/runtime/include -Igenerated\n{name}_OBJCCFLAGS += -std=c++17 -fobjc-arc -I$(IAOT_ROOT)/runtime/include -Igenerated\n{name}_LDFLAGS += -ObjC\ninclude $(THEOS_MAKE_PATH)/library.mk\n"))?;
+    fs::write(
+        d.join("user/UserHooks.mm"),
+        include_str!("../../templates/theos-dylib/user/UserHooks.mm"),
+    )?;
+    fs::write(
+        d.join("user/UserMenu.mm"),
+        include_str!("../../templates/theos-dylib/user/UserMenu.mm"),
+    )?;
+    fs::write(
+        d.join("user/UserFeatures.hpp"),
+        include_str!("../../templates/theos-dylib/user/UserFeatures.hpp"),
+    )?;
+    let makefile = include_str!("../../templates/theos-dylib/Makefile")
+        .replace("IAOT_ROOT := ../..", "IAOT_ROOT ?= ..")
+        .replace("ExampleHooks", name);
+    fs::write(d.join("Makefile"), makefile)?;
     let m = manifest::load(&manifest_path)?;
     manifest::validate(&m, false)?;
     generate::generate(&m, &manifest_path)?;
@@ -153,6 +211,54 @@ fn main() -> anyhow::Result<()> {
             let m = validated(&manifest, force_authorized)?;
             generate::generate(&m, &manifest)?;
             println!("generated files next to {}", manifest.display())
+        }
+        Cmd::AnalyzeIpa { input, reports } => {
+            let report = analyzer::analyze_ipa(&input)?;
+            print!("{}", analyzer::human_report(&report));
+            if let Some(directory) = reports {
+                analyzer::write_reports(&report, &directory)?;
+                println!("reports written to {}", directory.display());
+            }
+        }
+        Cmd::Prepare {
+            manifest,
+            input,
+            reports,
+        } => pipeline::prepare(&manifest, &input, &reports)?,
+        Cmd::Pipeline {
+            manifest,
+            input,
+            output,
+            dylib,
+            build_runtime,
+            reports,
+            work_dir,
+        } => {
+            let configured = manifest::load(&manifest)?;
+            let resolve = |path: PathBuf| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    configured.source_dir.join(path)
+                }
+            };
+            let input = input
+                .or_else(|| configured.paths.input_ipa.clone())
+                .map(resolve)
+                .ok_or_else(|| anyhow::anyhow!("pipeline needs --in or paths.input_ipa"))?;
+            let output = output
+                .or_else(|| configured.paths.output_ipa.clone())
+                .map(resolve)
+                .ok_or_else(|| anyhow::anyhow!("pipeline needs --out or paths.output_ipa"))?;
+            pipeline::run(pipeline::PipelineOptions {
+                manifest_path: &manifest,
+                input_ipa: &input,
+                output_ipa: &output,
+                dylib: dylib.as_deref(),
+                build_runtime,
+                reports_dir: reports.as_deref(),
+                work_dir: work_dir.as_deref(),
+            })?;
         }
         Cmd::Build => {
             let status = Command::new("make").status()?;
@@ -193,13 +299,20 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("input and output IPA paths must differ")
             }
             let m = validated(&manifest, force_authorized)?;
+            let unity_member = if member.is_none() && m.app.prefer_unity_framework {
+                ipa::find_unity_framework_member(&input)?
+            } else {
+                None
+            };
             let executable_member = member
+                .or(unity_member)
                 .or_else(|| m.app.executable_member.clone())
                 .ok_or_else(|| anyhow::anyhow!("supply --member or app.executable_member"))?;
             let temp = tempfile::tempdir()?;
             let original = temp.path().join("original-macho");
             let patched = temp.path().join("patched-macho");
             ipa::extract_member(&input, &executable_member, &original)?;
+            println!("target member: {executable_member}");
             let report = macho::patch_with_options(
                 &m,
                 &original,
@@ -212,10 +325,7 @@ fn main() -> anyhow::Result<()> {
                 if !path.is_file() {
                     anyhow::bail!("dylib file does not exist: {}", path.display())
                 }
-                let app_dir = executable_member
-                    .rsplit_once('/')
-                    .map(|x| x.0)
-                    .ok_or_else(|| anyhow::anyhow!("executable member has no app directory"))?;
+                let app_dir = ipa::app_bundle_root(&executable_member)?;
                 Some((
                     format!("{app_dir}/Frameworks/{}", m.runtime.dylib_name),
                     path,
