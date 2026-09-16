@@ -1,6 +1,8 @@
 #pragma once
 #include <cstdint>
-#if !defined(__APPLE__)
+#if defined(__APPLE__)
+#include <mach-o/loader.h>
+#else
 struct mach_header_64;
 #endif
 namespace iaot {

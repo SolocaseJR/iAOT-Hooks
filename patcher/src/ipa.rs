@@ -136,31 +136,42 @@ pub fn repack_many(
     let mut replacement_seen = std::collections::HashSet::new();
     let mut addition_seen = std::collections::HashSet::new();
     for i in 0..zip.len() {
-        let mut file = zip.by_index(i)?;
+        let file = zip.by_index(i)?;
         let name = file.name().to_owned();
-        let options = SimpleFileOptions::default()
-            .compression_method(file.compression())
-            .last_modified_time(file.last_modified().unwrap_or_default())
-            .unix_permissions(file.unix_mode().unwrap_or(if file.is_dir() {
-                0o755
-            } else {
-                0o644
-            }));
         if file.is_dir() {
+            let options = SimpleFileOptions::default()
+                .last_modified_time(file.last_modified().unwrap_or_default())
+                .unix_permissions(file.unix_mode().unwrap_or(0o755));
             writer.add_directory(name, options)?;
-        } else {
+            continue;
+        }
+        if let Some(replacement) = replacement_map.get(name.as_str()) {
+            let options = SimpleFileOptions::default()
+                .compression_method(file.compression())
+                .last_modified_time(file.last_modified().unwrap_or_default())
+                .unix_permissions(file.unix_mode().unwrap_or(0o644));
             writer.start_file(&name, options)?;
-            if let Some(replacement) = replacement_map.get(name.as_str()) {
-                let mut source = File::open(replacement)?;
-                std::io::copy(&mut source, &mut writer)?;
-                replacement_seen.insert(name.clone());
-            } else if let Some(addition) = addition_map.get(name.as_str()) {
-                let mut source = File::open(addition)?;
-                std::io::copy(&mut source, &mut writer)?;
-                addition_seen.insert(name.clone());
-            } else {
-                std::io::copy(&mut file, &mut writer)?;
-            }
+            let mut source = File::open(replacement)?;
+            std::io::copy(&mut source, &mut writer)?;
+            replacement_seen.insert(name.clone());
+        } else if let Some(addition) = addition_map.get(name.as_str()) {
+            let options = SimpleFileOptions::default()
+                .compression_method(file.compression())
+                .last_modified_time(file.last_modified().unwrap_or_default())
+                .unix_permissions(file.unix_mode().unwrap_or(0o644));
+            writer.start_file(&name, options)?;
+            let mut source = File::open(addition)?;
+            std::io::copy(&mut source, &mut writer)?;
+            addition_seen.insert(name.clone());
+        } else {
+            // Copy the already-compressed bytes directly instead of
+            // decompressing then recompressing every untouched entry. Most
+            // of an IPA (Unity asset bundles, embedded frameworks, etc.) is
+            // not part of a patch pass, so decompress+recompress of every
+            // one of those multi-gigabyte entries was the dominant cost of
+            // repackaging; raw_copy_file skips both codec passes for
+            // anything that isn't actually being replaced.
+            writer.raw_copy_file(file)?;
         }
     }
     if replacement_seen.len() != replacement_map.len() {
@@ -195,6 +206,15 @@ pub fn publish_file(source: &Path, output: &Path) -> anyhow::Result<()> {
     }
     let parent = output.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
+    // The staged artifact and the output directory are normally on the same
+    // volume (both under the project tree), so a rename is an atomic,
+    // near-instant directory-entry update instead of copying every byte of a
+    // multi-gigabyte IPA a second time. Only fall back to the copy-then-
+    // persist path (still atomic, via a same-directory temp file) when the
+    // rename can't cross filesystems (e.g. a work_dir on another drive).
+    if std::fs::rename(source, output).is_ok() {
+        return Ok(());
+    }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     let mut input = File::open(source)?;
     std::io::copy(&mut input, temporary.as_file_mut())?;

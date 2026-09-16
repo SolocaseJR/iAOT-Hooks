@@ -1,7 +1,8 @@
 use crate::errors::IaotError;
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -42,15 +43,107 @@ pub struct Runtime {
     pub cave_segment: String,
     pub page_size: u64,
     pub dylib_name: String,
+    /// Optional path to an IL2CPP metadata dump. This can be a directory or a
+    /// single file, in any of the auto-detected formats (see il2cpp_metadata.rs):
+    ///   * a Cpp2IL analysis package (cpp2il_methods.jsonl [+ cpp2il_types.jsonl])
+    ///   * an Il2CppDumper `script.json` (methods) and/or `dump.cs` (+ fields)
+    /// When set, any offline_* entry and the string factory may be specified by
+    /// name only and their address/offset is resolved from the dump at generate
+    /// time instead of being hand-typed. Resolved relative to source_dir.
+    #[serde(default)]
+    pub metadata_package: Option<PathBuf>,
+    /// Optional override for the metadata dump format: "auto" (default),
+    /// "cpp2il", or "il2cpp_dumper". Leave unset to detect from the files present.
+    #[serde(default)]
+    pub metadata_format: Option<String>,
+    /// Optional RVA of the target's own UTF-16 managed-string constructor.
+    /// This is used when a stripped Unity IL2CPP binary does not export
+    /// il2cpp_string_new but still contains its generated String runtime.
+    /// When `string_factory` (name-based) and `metadata_package` are set this
+    /// is resolved automatically; an explicit value here still wins.
+    #[serde(default)]
+    pub string_factory_rva: Option<u64>,
+    /// Optional name-based spec for the managed-string constructor, resolved
+    /// against metadata_package into string_factory_rva.
+    #[serde(default)]
+    pub string_factory: Option<OfflineMethod>,
+    #[serde(default)]
+    pub offline_classes: Vec<OfflineClass>,
+    #[serde(default)]
+    pub offline_methods: Vec<OfflineMethod>,
+    #[serde(default)]
+    pub offline_fields: Vec<OfflineField>,
+    #[serde(default)]
+    pub offline_internal_calls: Vec<OfflineInternalCall>,
 }
+#[derive(Clone, Debug, Deserialize)]
+pub struct OfflineClass {
+    pub module: String,
+    pub namespace: String,
+    pub name: String,
+}
+#[derive(Clone, Debug, Deserialize)]
+pub struct OfflineMethod {
+    pub module: String,
+    pub namespace: String,
+    #[serde(rename = "class")]
+    pub class_name: String,
+    pub name: String,
+    #[serde(default = "default_parameter_count")]
+    pub parameter_count: i32,
+    /// Optional exact managed parameter-type list (e.g. ["System.Char*"]) used
+    /// to disambiguate overloads that share an arity when resolving from the
+    /// metadata package. Takes precedence over parameter_count for matching.
+    #[serde(default)]
+    pub parameter_types: Option<Vec<String>>,
+    /// Explicit native RVA. Optional when metadata_package is set (resolved by
+    /// name); an explicit value always wins over dump resolution.
+    #[serde(default)]
+    pub rva: Option<u64>,
+}
+#[derive(Clone, Debug, Deserialize)]
+pub struct OfflineField {
+    pub module: String,
+    pub namespace: String,
+    #[serde(rename = "class")]
+    pub class_name: String,
+    pub name: String,
+    /// Explicit field offset. Optional when metadata_package is set.
+    #[serde(default)]
+    pub offset: Option<u64>,
+    /// Field size in bytes. Optional; filled from the dump, else defaults to a
+    /// pointer width when neither the manifest nor the dump provides it.
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+#[derive(Clone, Debug, Deserialize)]
+pub struct OfflineInternalCall {
+    pub name: String,
+    pub module: String,
+    /// Explicit native RVA. Optional when metadata_package is set.
+    #[serde(default)]
+    pub rva: Option<u64>,
+}
+fn default_parameter_count() -> i32 {
+    -1
+}
+/// Fallback field width (pointer size) when neither the manifest nor the
+/// metadata package supplies a size for an offline field.
+pub const DEFAULT_FIELD_SIZE: u64 = 8;
 #[derive(Clone, Debug, Deserialize)]
 pub struct App {
     pub executable_member: Option<String>,
-    pub authorized_only: bool,
     #[serde(default)]
     pub prefer_unity_framework: bool,
     #[serde(default)]
     pub target_module: Option<String>,
+    /// Optional SpringBoard/home-screen name override.
+    #[serde(default, alias = "app_name")]
+    pub display_name: Option<String>,
+    /// Optional square PNG used to generate the complete iPhone/iPad icon set.
+    /// Relative paths are resolved from the hook-project directory.
+    #[serde(default, alias = "icon")]
+    pub icon_path: Option<PathBuf>,
 }
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Paths {
@@ -67,6 +160,12 @@ pub struct Build {
     pub log_level: String,
     pub menu: bool,
     pub persistence: bool,
+    #[serde(default = "default_true")]
+    pub runtime_autostart: bool,
+    /// Build only a no-op dylib.  This is a launch-diagnostics control and
+    /// deliberately omits all IAOT runtime, hook, overlay, and ObjC++ code.
+    #[serde(default)]
+    pub minimal_runtime: bool,
     pub clean_temporary: bool,
     pub signing: String,
 }
@@ -77,6 +176,8 @@ impl Default for Build {
             log_level: "info".into(),
             menu: true,
             persistence: true,
+            runtime_autostart: true,
+            minimal_runtime: false,
             clean_temporary: true,
             signing: "external".into(),
         }
@@ -141,11 +242,15 @@ pub struct Callback {
 #[derive(Clone, Debug, Deserialize)]
 pub struct GeneratedHook {
     pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub symbol: String,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct Function {
     pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub signature: Option<String>,
     #[serde(default)]
     pub kind: Option<String>,
@@ -174,6 +279,19 @@ pub struct Patch {
     pub description: String,
     pub locator: Locator,
     pub patch: PatchOperation,
+    /// Single-declaration shorthand for a branch-to-callback patch. When set,
+    /// the loader creates and auto-registers the callback entry, using
+    /// `signature` and an automatically allocated callback index.
+    #[serde(default)]
+    pub replacement: Option<String>,
+    /// Optional explicit callback slot for `replacement`. Most projects should
+    /// omit this and let IAOT allocate the first available slot.
+    #[serde(default)]
+    pub callback_index: Option<u32>,
+    /// Allocate an original trampoline automatically. The generated accessor
+    /// remains `iaot::generated::Original_<patch name>()`.
+    #[serde(default)]
+    pub preserve_original: bool,
     #[serde(default)]
     pub expect: Option<String>,
     #[serde(default)]
@@ -207,6 +325,7 @@ pub enum Locator {
         expected_matches: Option<usize>,
         segment: Option<String>,
         section: Option<String>,
+        fallback_rva: Option<u64>,
     },
     Xref {
         pattern: String,
@@ -250,30 +369,327 @@ pub enum Locator {
 pub struct PatchOperation {
     #[serde(rename = "type")]
     pub kind: String,
-    pub action: PatchAction,
+    #[serde(default)]
+    pub action: Option<PatchAction>,
+    #[serde(default)]
+    pub instruction_offset: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PatchAction {
-    RetIfFlag { flag: String },
-    ZeroRegisterIfFlag { flag: String, register: u8 },
-    CallbackIfFlag { flag: String, callback: String },
-    CallbackReturnZeroIfFlag { flag: String, callback: String },
-    CallbackAfter { callback: String },
-    BranchToCallback { callback: String },
-    BranchToReplacement { symbol: String },
+    RetIfFlag {
+        flag: String,
+    },
+    ZeroRegisterIfFlag {
+        flag: String,
+        register: u8,
+    },
+    CallbackIfFlag {
+        flag: String,
+        #[serde(default)]
+        callback: Option<String>,
+    },
+    CallbackReturnZeroIfFlag {
+        flag: String,
+        #[serde(default)]
+        callback: Option<String>,
+    },
+    CallbackAfter {
+        #[serde(default)]
+        callback: Option<String>,
+    },
+    BranchToCallback {
+        #[serde(default)]
+        callback: Option<String>,
+    },
+    BranchToReplacement {
+        symbol: String,
+    },
 }
 
 fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ManifestReferences {
+    #[serde(default)]
+    project_config: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Il2CppConfigReference {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    config_file: Option<PathBuf>,
+}
+
+fn read_yaml(path: &Path, label: &str) -> anyhow::Result<serde_yaml::Value> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("cannot read {label} {}", path.display()))?;
+    serde_yaml::from_str(&text).with_context(|| format!("cannot parse {label} {}", path.display()))
+}
+
+fn yaml_field<'a>(value: &'a serde_yaml::Value, name: &str) -> Option<&'a serde_yaml::Value> {
+    value
+        .as_mapping()?
+        .get(serde_yaml::Value::String(name.to_owned()))
+}
+
+fn merge_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
+    match (base, overlay) {
+        (serde_yaml::Value::Mapping(base_map), serde_yaml::Value::Mapping(overlay_map)) => {
+            for (key, value) in overlay_map {
+                if let Some(existing) = base_map.get_mut(&key) {
+                    merge_yaml(existing, value);
+                } else {
+                    base_map.insert(key, value);
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+fn force_il2cpp_disabled(value: &mut serde_yaml::Value) -> anyhow::Result<()> {
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("configs.yaml root must be a mapping"))?;
+    let analysis_key = serde_yaml::Value::String("analysis".into());
+    let analysis = root
+        .entry(analysis_key)
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    let analysis = analysis
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("configs.yaml analysis must be a mapping"))?;
+    analysis.insert(
+        serde_yaml::Value::String("static_il2cpp".into()),
+        serde_yaml::Value::Bool(false),
+    );
+    analysis.insert(
+        serde_yaml::Value::String("runtime_il2cpp".into()),
+        serde_yaml::Value::Bool(false),
+    );
+    Ok(())
+}
+
 pub fn load(path: &Path) -> anyhow::Result<Manifest> {
-    let text = fs::read_to_string(path)?;
-    let mut manifest: Manifest = serde_yaml::from_str(&text)?;
-    manifest.source_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let hooks = read_yaml(path, "hook manifest")?;
+    let references: ManifestReferences = serde_yaml::from_value(hooks.clone())
+        .with_context(|| format!("cannot read references from {}", path.display()))?;
+    let source_dir = path.parent().unwrap_or(Path::new("."));
+
+    let effective = if let Some(configured) = references.project_config {
+        let config_path = if configured.is_absolute() {
+            configured
+        } else {
+            source_dir.join(configured)
+        };
+        let mut merged = read_yaml(&config_path, "project config")?;
+        let il2cpp: Il2CppConfigReference = yaml_field(&merged, "il2cpp")
+            .cloned()
+            .map(serde_yaml::from_value)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "cannot parse il2cpp selection in project config {}",
+                    config_path.display()
+                )
+            })?
+            .unwrap_or_default();
+
+        if il2cpp.enabled {
+            let configured = il2cpp.config_file.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "il2cpp.enabled is true but il2cpp.config_file is missing in {}",
+                    config_path.display()
+                )
+            })?;
+            let config_dir = config_path.parent().unwrap_or(source_dir);
+            let il2cpp_path = if configured.is_absolute() {
+                configured
+            } else {
+                config_dir.join(configured)
+            };
+            merge_yaml(&mut merged, read_yaml(&il2cpp_path, "IL2CPP config")?);
+        } else {
+            // Analysis defaults historically enable both IL2CPP paths. An
+            // explicit disabled selector must override those defaults even
+            // when no IL2CPP file is loaded.
+            force_il2cpp_disabled(&mut merged)?;
+        }
+
+        // hooks.yaml is the final layer so a hook project may intentionally
+        // override a shared base config without mutating the shared file.
+        merge_yaml(&mut merged, hooks);
+        merged
+    } else {
+        // Backward compatibility for existing single-file manifests.
+        hooks
+    };
+
+    let mut manifest: Manifest = serde_yaml::from_value(effective)
+        .with_context(|| format!("cannot construct manifest from {}", path.display()))?;
+    manifest.source_dir = source_dir.to_path_buf();
+    expand_replacement_shorthand(&mut manifest)?;
     Ok(manifest)
+}
+
+fn first_free_slot(used: &HashSet<u32>, capacity: u32, label: &str) -> anyhow::Result<u32> {
+    (0..capacity)
+        .find(|index| !used.contains(index))
+        .ok_or_else(|| anyhow::anyhow!("no free {label} slots remain (capacity {capacity})"))
+}
+
+/// Convert the concise, user-facing replacement form into the same callback
+/// and patch representation used by legacy manifests. Keeping one normalized
+/// internal representation means the cave writer and runtime do not need a
+/// second implementation path.
+fn expand_replacement_shorthand(manifest: &mut Manifest) -> anyhow::Result<()> {
+    let mut callback_names: HashSet<String> = manifest
+        .config
+        .callbacks
+        .iter()
+        .map(|callback| callback.name.clone())
+        .collect();
+    let mut callback_slots: HashSet<u32> = manifest
+        .config
+        .callbacks
+        .iter()
+        .map(|callback| callback.index)
+        .collect();
+    let mut original_slots: HashSet<u32> = manifest
+        .patches
+        .iter()
+        .filter(|patch| patch.enabled)
+        .filter_map(|patch| patch.original_slot)
+        .collect();
+
+    for patch in &mut manifest.patches {
+        // Disabled patches are not emitted or applied, so they must not consume
+        // finite runtime callback/original slots during manifest resolution.
+        if !patch.enabled {
+            continue;
+        }
+
+        let Some(symbol) = patch.replacement.clone() else {
+            if patch.callback_index.is_some() {
+                anyhow::bail!(
+                    "patch {} sets callback_index without replacement",
+                    patch.name
+                );
+            }
+            if patch.preserve_original && patch.original_slot.is_none() {
+                patch.original_slot =
+                    Some(first_free_slot(&original_slots, 64, "original trampoline")?);
+                original_slots.insert(patch.original_slot.unwrap());
+            }
+            continue;
+        };
+
+        if patch.patch.kind != "branch_to_cave" {
+            anyhow::bail!(
+                "patch {} replacement shorthand requires patch.type branch_to_cave",
+                patch.name
+            );
+        }
+        if !c_symbol(&patch.name) {
+            anyhow::bail!(
+                "patch {} needs a C-identifier name when replacement shorthand is used",
+                patch.name
+            );
+        }
+        if !c_symbol(&symbol) {
+            anyhow::bail!(
+                "patch {} has invalid replacement symbol {}",
+                patch.name,
+                symbol
+            );
+        }
+        let signature = patch.signature.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "patch {} replacement shorthand requires an exact signature",
+                patch.name
+            )
+        })?;
+        if !valid_signature(&signature) {
+            anyhow::bail!(
+                "patch {} replacement shorthand has an invalid signature",
+                patch.name
+            );
+        }
+        if !callback_names.insert(patch.name.clone()) {
+            anyhow::bail!(
+                "patch {} replacement shorthand collides with an existing callback name",
+                patch.name
+            );
+        }
+
+        let callback_index = match patch.callback_index {
+            Some(index) => {
+                if index >= 64 {
+                    anyhow::bail!(
+                        "patch {} callback_index exceeds runtime capacity",
+                        patch.name
+                    );
+                }
+                if !callback_slots.insert(index) {
+                    anyhow::bail!(
+                        "patch {} callback_index {} is already in use",
+                        patch.name,
+                        index
+                    );
+                }
+                index
+            }
+            None => {
+                let index = first_free_slot(&callback_slots, 64, "callback")?;
+                callback_slots.insert(index);
+                index
+            }
+        };
+
+        match &mut patch.patch.action {
+            None => {
+                patch.patch.action = Some(PatchAction::BranchToCallback {
+                    callback: Some(patch.name.clone()),
+                });
+            }
+            Some(
+                PatchAction::CallbackIfFlag { callback, .. }
+                | PatchAction::CallbackReturnZeroIfFlag { callback, .. }
+                | PatchAction::CallbackAfter { callback }
+                | PatchAction::BranchToCallback { callback },
+            ) if callback.as_deref().is_none_or(|name| name == patch.name) => {
+                *callback = Some(patch.name.clone());
+            }
+            Some(_) => {
+                anyhow::bail!(
+                    "patch {} replacement shorthand requires a callback action and may not reference another callback",
+                    patch.name
+                )
+            }
+        }
+
+        manifest.config.callbacks.push(Callback {
+            name: patch.name.clone(),
+            index: callback_index,
+            symbol,
+            signature: Some(signature),
+            // A disabled shorthand patch should not force an otherwise unused
+            // replacement symbol to be implemented and linked.
+            auto_register: patch.enabled,
+        });
+
+        if patch.preserve_original && patch.original_slot.is_none() {
+            let slot = first_free_slot(&original_slots, 64, "original trampoline")?;
+            original_slots.insert(slot);
+            patch.original_slot = Some(slot);
+        }
+    }
+    Ok(())
 }
 fn c_symbol(s: &str) -> bool {
     let mut it = s.chars();
@@ -292,12 +708,7 @@ fn unique<T: std::hash::Hash + Eq + Copy>(
     }
     Ok(())
 }
-pub fn validate(m: &Manifest, force: bool) -> Result<(), IaotError> {
-    if !m.app.authorized_only && !force {
-        return Err(IaotError::Manifest(
-            "app.authorized_only must be true (or explicitly pass --force-authorized)".into(),
-        ));
-    }
+pub fn validate(m: &Manifest, _force: bool) -> Result<(), IaotError> {
     if m.project.name.is_empty()
         || m.project.bundle_id.is_empty()
         || m.runtime.dylib_name.is_empty()
@@ -314,6 +725,39 @@ pub fn validate(m: &Manifest, force: bool) -> Result<(), IaotError> {
         return Err(IaotError::Manifest(
             "runtime.dylib_name must be an ASCII filename of at most 255 bytes, not a path".into(),
         ));
+    }
+    if let Some(display_name) = &m.app.display_name {
+        let trimmed = display_name.trim();
+        if trimmed.is_empty()
+            || trimmed.chars().count() > 255
+            || trimmed.chars().any(char::is_control)
+        {
+            return Err(IaotError::Manifest(
+                "app.display_name must contain 1-255 non-control characters".into(),
+            ));
+        }
+    }
+    if let Some(icon_path) = &m.app.icon_path {
+        if icon_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_none_or(|value| !value.eq_ignore_ascii_case("png"))
+        {
+            return Err(IaotError::Manifest(
+                "app.icon_path must point to a PNG file".into(),
+            ));
+        }
+        let resolved = if icon_path.is_absolute() {
+            icon_path.clone()
+        } else {
+            m.source_dir.join(icon_path)
+        };
+        if !resolved.is_file() {
+            return Err(IaotError::Manifest(format!(
+                "app.icon_path does not exist: {}",
+                resolved.display()
+            )));
+        }
     }
     if m.project.platform != "ios" || m.project.arch != "arm64" {
         return Err(IaotError::Manifest(
@@ -434,6 +878,7 @@ pub fn validate(m: &Manifest, force: bool) -> Result<(), IaotError> {
             )));
         }
     }
+    let mut callback_signatures = HashMap::new();
     for callback in &m.config.callbacks {
         if !c_symbol(&callback.symbol) {
             return Err(IaotError::Manifest(format!(
@@ -451,6 +896,18 @@ pub fn validate(m: &Manifest, force: bool) -> Result<(), IaotError> {
                 "auto-registered callback {} needs a valid signature",
                 callback.name
             )));
+        }
+        if callback.auto_register {
+            let signature = callback.signature.as_deref().unwrap();
+            if let Some(previous) = callback_signatures.insert(callback.symbol.as_str(), signature)
+            {
+                if previous != signature {
+                    return Err(IaotError::Manifest(format!(
+                        "callback symbol {} is registered with conflicting signatures",
+                        callback.symbol
+                    )));
+                }
+            }
         }
     }
     if m.config.strings.iter().any(|x| x.default.len() >= 256) {
@@ -568,13 +1025,43 @@ pub fn validate(m: &Manifest, force: bool) -> Result<(), IaotError> {
     let flags: HashSet<_> = m.config.flags.iter().map(|x| x.name.as_str()).collect();
     let callbacks: HashSet<_> = m.config.callbacks.iter().map(|x| x.name.as_str()).collect();
     for patch in &m.patches {
-        if patch.name.is_empty()
-            || patch.description.is_empty()
-            || patch.patch.kind != "branch_to_cave"
-        {
+        if patch.name.is_empty() || patch.description.is_empty() {
             return Err(IaotError::Manifest(
-                "patch name/description are required and patch.type must be branch_to_cave".into(),
+                "patch name and description are required".into(),
             ));
+        }
+        // Disabled patches are retained as project documentation/configuration,
+        // but they do not participate in callback wiring or binary mutation.
+        if !patch.enabled {
+            continue;
+        }
+        match patch.patch.kind.as_str() {
+            "branch_to_cave"
+                if patch.patch.action.is_some() && patch.patch.instruction_offset.is_none() => {}
+            "branch_to_instruction_target"
+                if patch.patch.action.is_none()
+                    && patch
+                        .patch
+                        .instruction_offset
+                        .is_none_or(|offset| offset % 4 == 0) => {}
+            "branch_to_cave" => {
+                return Err(IaotError::Manifest(format!(
+                    "patch {} branch_to_cave requires action and forbids instruction_offset",
+                    patch.name
+                )))
+            }
+            "branch_to_instruction_target" => {
+                return Err(IaotError::Manifest(format!(
+                    "patch {} branch_to_instruction_target requires an aligned instruction_offset and forbids action",
+                    patch.name
+                )))
+            }
+            _ => {
+                return Err(IaotError::Manifest(format!(
+                    "patch {} has unsupported patch type {}",
+                    patch.name, patch.patch.kind
+                )))
+            }
         }
         match &patch.locator {
             Locator::Pattern { pattern, .. } | Locator::Xref { pattern, .. }
@@ -614,7 +1101,10 @@ pub fn validate(m: &Manifest, force: bool) -> Result<(), IaotError> {
             )));
         }
         if patch.original_slot.is_some()
-            && !matches!(patch.patch.action, PatchAction::BranchToCallback { .. })
+            && !matches!(
+                patch.patch.action.as_ref(),
+                Some(PatchAction::BranchToCallback { .. })
+            )
         {
             return Err(IaotError::Manifest(format!(
                 "patch {} can preserve a typed original only with branch_to_callback",
@@ -638,46 +1128,53 @@ pub fn validate(m: &Manifest, force: bool) -> Result<(), IaotError> {
                 patch.name
             )));
         }
-        match &patch.patch.action {
-            PatchAction::RetIfFlag { flag } | PatchAction::ZeroRegisterIfFlag { flag, .. }
-                if !flags.contains(flag.as_str()) =>
-            {
-                return Err(IaotError::Manifest(format!(
-                    "patch {} references an unknown flag",
-                    patch.name
-                )))
+        if let Some(action) = &patch.patch.action {
+            match action {
+                PatchAction::RetIfFlag { flag } | PatchAction::ZeroRegisterIfFlag { flag, .. }
+                    if !flags.contains(flag.as_str()) =>
+                {
+                    return Err(IaotError::Manifest(format!(
+                        "patch {} references an unknown flag",
+                        patch.name
+                    )))
+                }
+                PatchAction::CallbackIfFlag { flag, callback }
+                | PatchAction::CallbackReturnZeroIfFlag { flag, callback }
+                    if !flags.contains(flag.as_str())
+                        || callback
+                            .as_deref()
+                            .is_none_or(|name| !callbacks.contains(name)) =>
+                {
+                    return Err(IaotError::Manifest(format!(
+                        "patch {} references an unknown flag or callback",
+                        patch.name
+                    )))
+                }
+                PatchAction::CallbackAfter { callback }
+                | PatchAction::BranchToCallback { callback }
+                    if callback
+                        .as_deref()
+                        .is_none_or(|name| !callbacks.contains(name)) =>
+                {
+                    return Err(IaotError::Manifest(format!(
+                        "patch {} references an unknown callback",
+                        patch.name
+                    )))
+                }
+                PatchAction::ZeroRegisterIfFlag { register, .. } if *register > 30 => {
+                    return Err(IaotError::Manifest(format!(
+                        "patch {} has an invalid register",
+                        patch.name
+                    )))
+                }
+                PatchAction::BranchToReplacement { symbol } if symbol.is_empty() => {
+                    return Err(IaotError::Manifest(format!(
+                        "patch {} has an empty replacement symbol",
+                        patch.name
+                    )))
+                }
+                _ => {}
             }
-            PatchAction::CallbackIfFlag { flag, callback }
-            | PatchAction::CallbackReturnZeroIfFlag { flag, callback }
-                if !flags.contains(flag.as_str()) || !callbacks.contains(callback.as_str()) =>
-            {
-                return Err(IaotError::Manifest(format!(
-                    "patch {} references an unknown flag or callback",
-                    patch.name
-                )))
-            }
-            PatchAction::CallbackAfter { callback }
-            | PatchAction::BranchToCallback { callback }
-                if !callbacks.contains(callback.as_str()) =>
-            {
-                return Err(IaotError::Manifest(format!(
-                    "patch {} references an unknown callback",
-                    patch.name
-                )))
-            }
-            PatchAction::ZeroRegisterIfFlag { register, .. } if *register > 30 => {
-                return Err(IaotError::Manifest(format!(
-                    "patch {} has an invalid register",
-                    patch.name
-                )))
-            }
-            PatchAction::BranchToReplacement { symbol } if symbol.is_empty() => {
-                return Err(IaotError::Manifest(format!(
-                    "patch {} has an empty replacement symbol",
-                    patch.name
-                )))
-            }
-            _ => {}
         }
         if let Some(expect) = &patch.expect {
             if expect == "auto" {
@@ -717,6 +1214,20 @@ mod tests {
     #[test]
     fn valid_example() {
         assert!(validate(&parse("").unwrap(), false).is_ok());
+    }
+    #[test]
+    fn generated_hook_enabled_defaults_to_true_and_honors_false() {
+        let default_hook: GeneratedHook =
+            serde_yaml::from_str("name: Default\nsymbol: InstallDefault\n").unwrap();
+        let disabled_hook: GeneratedHook =
+            serde_yaml::from_str("name: Disabled\nenabled: false\nsymbol: InstallDisabled\n")
+                .unwrap();
+        assert!(default_hook.enabled);
+        assert!(!disabled_hook.enabled);
+        assert!(serde_yaml::from_str::<GeneratedHook>(
+            "name: Invalid\nenabled: definitely\nsymbol: InstallInvalid\n"
+        )
+        .is_err());
     }
     #[test]
     fn duplicate_flag() {
@@ -774,6 +1285,87 @@ mod tests {
         assert!(validate(&m, false).is_err());
     }
     #[test]
+    fn conflicting_callback_symbol_signatures_are_rejected() {
+        let mut m = parse("").unwrap();
+        m.config.callbacks = vec![
+            Callback {
+                name: "first".into(),
+                index: 0,
+                symbol: "SharedReplacement".into(),
+                signature: Some("void()".into()),
+                auto_register: true,
+            },
+            Callback {
+                name: "second".into(),
+                index: 1,
+                symbol: "SharedReplacement".into(),
+                signature: Some("int(void*)".into()),
+                auto_register: true,
+            },
+        ];
+        assert!(validate(&m, false).is_err());
+    }
+    #[test]
+    fn replacement_shorthand_allocates_and_wires_runtime_slots() {
+        let mut m = parse("").unwrap();
+        m.patches.push(
+            serde_yaml::from_str(
+                "name: ExampleHook\n\
+                 enabled: true\n\
+                 description: owned shorthand fixture\n\
+                 replacement: IAOT_ExampleHook\n\
+                 signature: 'int(void*, int)'\n\
+                 preserve_original: true\n\
+                 locator: { type: rva, value: 4096 }\n\
+                 patch: { type: branch_to_cave }\n",
+            )
+            .unwrap(),
+        );
+
+        expand_replacement_shorthand(&mut m).unwrap();
+        validate(&m, false).unwrap();
+
+        assert_eq!(m.config.callbacks.len(), 1);
+        let callback = &m.config.callbacks[0];
+        assert_eq!(callback.name, "ExampleHook");
+        assert_eq!(callback.index, 0);
+        assert_eq!(callback.symbol, "IAOT_ExampleHook");
+        assert_eq!(callback.signature.as_deref(), Some("int(void*, int)"));
+        assert!(callback.auto_register);
+        assert_eq!(m.patches[0].original_slot, Some(0));
+        assert!(matches!(
+            m.patches[0].patch.action,
+            Some(PatchAction::BranchToCallback {
+                callback: Some(ref name)
+            }) if name == "ExampleHook"
+        ));
+    }
+    #[test]
+    fn disabled_replacement_shorthand_does_not_consume_runtime_slots() {
+        let mut m = parse("").unwrap();
+        for index in 0..70 {
+            m.patches.push(
+                serde_yaml::from_str(&format!(
+                    "name: DisabledHook{index}\n\
+                     enabled: false\n\
+                     description: disabled shorthand fixture\n\
+                     replacement: IAOT_DisabledHook\n\
+                     signature: 'void()'\n\
+                     preserve_original: true\n\
+                     locator: {{ type: rva, value: 4096 }}\n\
+                     patch: {{ type: branch_to_cave, action: {{ type: branch_to_callback }} }}\n"
+                ))
+                .unwrap(),
+            );
+        }
+
+        expand_replacement_shorthand(&mut m).unwrap();
+        validate(&m, false).unwrap();
+        assert!(m.config.callbacks.is_empty());
+        assert!(m.patches.iter().all(|patch| patch.original_slot.is_none()));
+    }
+
+    #[test]
     fn missing_hook_symbol() {
         let yaml="project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: { authorized_only: true }\ngenerated_hooks: [{ name: bad }]";
         assert!(serde_yaml::from_str::<Manifest>(yaml).is_err());
@@ -808,5 +1400,56 @@ mod tests {
         let mut m = parse("").unwrap();
         m.app.executable_member = Some("../escape".into());
         assert!(validate(&m, false).is_err());
+    }
+
+    #[test]
+    fn split_configs_are_merged_and_il2cpp_is_optional() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("hooks.yaml"),
+            "project_config: configs.yaml\nconfig: { flags: [], strings: [], callbacks: [] }\nfunctions: []\ngenerated_hooks: []\npatches: []\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("configs.yaml"),
+            "project: { name: Split, bundle_id: com.example.split, platform: ios, arch: arm64, min_ios: '14.0' }\npaths: { output_ipa: build/Split.ipa }\nbuild: { mode: release }\nanalysis: { application_type: auto, rendering_backend: auto }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Split.dylib }\napp: { prefer_unity_framework: false }\nil2cpp: { enabled: false, config_file: missing-file-is-not-read.yaml }\n",
+        )
+        .unwrap();
+
+        let loaded = load(&directory.path().join("hooks.yaml")).unwrap();
+        assert_eq!(loaded.project.name, "Split");
+        assert_eq!(loaded.build.mode, "release");
+        assert!(!loaded.analysis.static_il2cpp);
+        assert!(!loaded.analysis.runtime_il2cpp);
+        validate(&loaded, false).unwrap();
+    }
+
+    #[test]
+    fn enabled_il2cpp_config_is_merged() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("hooks.yaml"),
+            "project_config: configs.yaml\nconfig: { flags: [], strings: [], callbacks: [] }\nfunctions: []\ngenerated_hooks: []\npatches: []\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("configs.yaml"),
+            "project: { name: Split, bundle_id: com.example.split, platform: ios, arch: arm64, min_ios: '14.0' }\nanalysis: { application_type: auto, rendering_backend: auto }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Split.dylib }\napp: { prefer_unity_framework: true }\nil2cpp: { enabled: true, config_file: il2cpp_config.yaml }\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("il2cpp_config.yaml"),
+            "analysis: { scripting_backend: il2cpp, static_il2cpp: true, runtime_il2cpp: true, il2cpp_module: UnityFramework }\nruntime: { offline_classes: [{ module: Assembly-CSharp, namespace: Demo, name: Player }] }\n",
+        )
+        .unwrap();
+
+        let loaded = load(&directory.path().join("hooks.yaml")).unwrap();
+        assert_eq!(loaded.analysis.scripting_backend, "il2cpp");
+        assert_eq!(
+            loaded.analysis.il2cpp_module.as_deref(),
+            Some("UnityFramework")
+        );
+        assert_eq!(loaded.runtime.offline_classes.len(), 1);
+        validate(&loaded, false).unwrap();
     }
 }

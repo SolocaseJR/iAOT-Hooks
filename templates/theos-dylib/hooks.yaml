@@ -1,38 +1,25 @@
-project:
-  name: ExampleHooks
-  bundle_id: com.example.authorized.target
-  platform: ios
-  arch: arm64
-  min_ios: "14.0"
-paths: { input_ipa: null, output_ipa: null, build_dir: build, generated_dir: generated/reports, temp_dir: build/temp }
-build: { mode: development, log_level: info, menu: true, persistence: true, clean_temporary: true, signing: external }
-analysis:
-  application_type: auto
-  scripting_backend: auto
-  rendering_backend: auto
-  il2cpp_module: null
-  static_il2cpp: true
-  runtime_il2cpp: true
-  il2cpp_method_manifest: generated/reports/il2cpp-methods.yaml
-  external_analyzer: auto
-runtime: { config_segment: "__IAOTCFG", cave_segment: "__IAOTCAVE", page_size: 16384, dylib_name: "ExampleHooks.dylib" }
-app: { executable_member: null, prefer_unity_framework: true, target_module: null, authorized_only: true }
+schema_version: 2
+project_config: configs.yaml
+
+# Hook-local runtime values. General project/build settings belong in
+# configs.yaml; IL2CPP metadata and imports belong in il2cpp_config.yaml.
 config:
   flags: [{ name: example_hook_enabled, index: 0, default: false }]
   strings: []
-  callbacks:
-    - { name: example_hook_callback, index: 0, symbol: IAOT_ExampleHook, signature: "int(void*, int)", auto_register: true }
+
 functions: []
 generated_hooks: [{ name: UserHooks, symbol: IAOT_InstallUserHooks }]
+
 patches:
   - name: ExampleHook
     enabled: false
     description: "Disabled placeholder; replace the locator and ABI before enabling"
+    replacement: IAOT_ExampleHook
+    preserve_original: true
     module: main
     signature: "int(void*, int)"
-    original_slot: 0
     failure_behavior: disable_hook
     architectures: [arm64]
     locator: { type: pattern, pattern: "FD 7B BF A9", expected_matches: 1, segment: "__TEXT", section: "__text" }
-    patch: { type: branch_to_cave, action: { type: branch_to_callback, callback: example_hook_callback } }
+    patch: { type: branch_to_cave }
     expect: auto

@@ -17,7 +17,8 @@ IAOT does not decrypt IPAs, bypass DRM, obtain signing identities, attach to ins
 - Runtime flags, callbacks, original trampolines, isolated hook status, Objective-C method replacement, persistence, structured log levels, and a minimal ImGui Metal overlay.
 - Optional IL2CPP exported-API resolution for metadata lookup, strings, fields, properties, managed invocation, and internal calls.
 - Multi-module patching, dylib embedding, `LC_LOAD_DYLIB` injection, IPA repackaging, reopen validation, and YAML reports through one command.
-- A drag-and-drop Windows entry point that builds the dylib in WSL/Theos and runs the complete pipeline.
+- A Windows entry point that accepts a project `hooks.yaml`, reads its split
+  configuration, builds the dylib in WSL/Theos, and runs the complete pipeline.
 
 ## Honest limits
 
@@ -27,7 +28,7 @@ IAOT does not decrypt IPAs, bypass DRM, obtain signing identities, attach to ins
 - The header must have enough existing load-command padding. IAOT does not shift all sections to manufacture space.
 - Typed originals support non-variadic AAPCS64 functions whose exact ABI is supplied by the user. A manifest string cannot prove a C++ ABI, structure-return convention, or proprietary object layout.
 - Runtime-installed native/IL2CPP hooks are intentionally absent. They are unnecessary for the no-JIT design and are not reliable enough to be the framework default.
-- The runtime IL2CPP resolver depends on exported `il2cpp_*` APIs. Stripped apps may provide partial or no runtime capabilities; native and Objective-C hooks remain usable.
+- The runtime IL2CPP resolver prefers exported `il2cpp_*` APIs and can use audited offline metadata/address bindings when those exports are stripped. Unmapped capabilities still degrade independently; native and Objective-C hooks remain usable.
 - IAOT removes stale code-signature commands from patched images but does not sign. The final app, frameworks, and dylib must be signed externally.
 
 ## Repository layout
@@ -57,7 +58,12 @@ iaot new MyHooks
 
 The only normal source files to edit are:
 
-- `MyHooks/hooks.yaml`: centralized paths, detection overrides, flags, callbacks, functions, and static patches.
+- `MyHooks/hooks.yaml`: hook-local flags, functions, and single-declaration
+  patches; callback/trampoline slots are allocated automatically.
+- `MyHooks/configs.yaml`: project identity, paths, output name, build settings,
+  app selection/branding, and general analysis settings.
+- `MyHooks/il2cpp_config.yaml`: optional IL2CPP-only metadata imports, string
+  factory, and offline resolver bindings.
 - `MyHooks/user/UserHooks.mm`: typed callbacks.
 - `MyHooks/user/UserMenu.mm`: the minimal ImGui menu.
 - `MyHooks/user/UserFeatures.hpp`: shared toggle helpers.
@@ -80,17 +86,37 @@ Prepare target-aware generated code:
 iaot prepare --manifest .\MyHooks\hooks.yaml --in "C:\IPAs\OwnedApp-Decrypted.ipa" --reports .\build\reports
 ```
 
-On Windows, drag the IPA onto `build_iaot_ipa.bat`, or run:
+On Windows, run `build_iaot_ipa.bat .\MyHooks\hooks.yaml`; optionally provide an
+input IPA as its second argument to override `configs.yaml`. Or run:
 
 ```powershell
 .\scripts\build-iaot.ps1 -InputIpa "C:\IPAs\OwnedApp-Decrypted.ipa" -Manifest ".\MyHooks\hooks.yaml"
 ```
 
-The script checks Cargo, WSL, the selected distribution, Theos, SDKs, compiler tools, Python, Make, rsync, and ImGui when the menu is enabled; builds the runtime in an isolated WSL directory; then calls the complete pipeline. The output defaults to:
+The script checks Cargo, WSL, the selected distribution, Theos, SDKs, compiler
+tools, Python, Make, rsync, and ImGui when the menu is enabled; builds the
+runtime in an isolated WSL directory; then calls the complete pipeline. Input,
+output, build, and report paths default to `configs.yaml`; CLI parameters remain
+explicit overrides.
+
+Optional app branding is configured without editing the target manually:
+
+```yaml
+app:
+  display_name: "My Instrumented App"
+  icon_path: assets/app-icon.png
+```
+
+The icon source must be a square PNG at least 180x180 pixels; 1024x1024 is
+recommended. IAOT removes alpha against an opaque white background, generates
+the complete iPhone/iPad icon set, updates the primary icon declarations, and
+updates localized `InfoPlist.strings` display names before repackaging.
+
+For a freshly scaffolded project the defaults are:
 
 ```text
-build/windows/<input-name>-IAOT-unsigned.ipa
-build/windows/reports/final-validation.yaml
+build/<project-name>-unsigned.ipa
+generated/reports/final-validation.yaml
 ```
 
 On Linux/WSL, build directly through the CLI:
@@ -111,30 +137,26 @@ Or pass an already built dylib using `--dylib path/to/MyHooks.dylib`.
 The template contains a disabled example. Replace its locator and ABI before enabling it.
 
 1. Analyze the IPA and read `ipa-analysis.yaml`. Confirm the selected executable/module, architecture, application type, Unity backend, and rendering evidence.
-2. Add a callback slot and flag in `hooks.yaml`:
+2. Add any feature flag needed by the hook:
 
 ```yaml
 config:
   flags:
     - { name: example_hook_enabled, index: 0, default: false }
-  callbacks:
-    - name: example_callback
-      index: 0
-      symbol: IAOT_ExampleHook
-      signature: "int(void*, int)"
-      auto_register: true
 ```
 
-3. Add the static bridge:
+3. Declare the static hook once. Callback and original-trampoline slots are
+   allocated automatically:
 
 ```yaml
 patches:
   - name: ExampleHook
     enabled: true
     description: "Authorized example entry hook"
+    replacement: IAOT_ExampleHook
+    preserve_original: true
     module: main
     signature: "int(void*, int)"
-    original_slot: 0
     failure_behavior: disable_hook
     locator:
       type: pattern
@@ -144,7 +166,6 @@ patches:
       section: "__text"
     patch:
       type: branch_to_cave
-      action: { type: branch_to_callback, callback: example_callback }
     expect: auto
 ```
 
@@ -165,9 +186,42 @@ extern "C" int IAOT_ExampleHook(void* instance, int value) {
 
 `expect: auto` records the displaced bytes for development. Pin those exact four bytes for a release build so an application update fails before mutation.
 
+For a state-preserving in-place ARM64 branch rewrite, use
+`branch_to_instruction_target`. The patcher reads an existing B/BL, B.cond,
+CBZ/CBNZ, or TBZ/TBNZ instruction and calculates its destination from the
+encoded PC-relative immediate. It then replaces the selected instruction with
+an unconditional branch to that destination:
+
+```yaml
+  - name: ExampleCheckedEpilogue
+    enabled: true
+    description: "Skip the positive path after the checked state is recorded"
+    module: owned_module
+    failure_behavior: abort
+    architectures: [arm64]
+    locator:
+      type: pattern
+      pattern: "00 00 00 34 AA BB CC DD"
+      expected_matches: 1
+      segment: __TEXT
+      section: __text
+    patch: { type: branch_to_instruction_target }
+```
+
+By default the target is decoded from the instruction at the matched patch
+site. Set `instruction_offset` to a signed byte offset when a nearby branch
+encodes the desired destination, for example
+`{ type: branch_to_instruction_target, instruction_offset: -12 }`.
+
 ## Static hooks versus runtime IL2CPP
 
 Static hooks are resolved offline and written before signing. They never wait for IL2CPP initialization. For IL2CPP name-based static hooks, import an audited method map and use `locator.type: il2cpp`; see [IL2CPP](docs/IL2CPP.md).
+
+For stripped IL2CPP builds, enable the IL2CPP file from `configs.yaml`, then
+point `runtime.metadata_package` in `il2cpp_config.yaml` at an offline dump.
+Name-only bindings are resolved to native RVAs/offsets at build time. Both
+Cpp2IL and Il2CppDumper formats are auto-detected. See [IL2CPP: offline metadata
+dumps](docs/IL2CPP.md#offline-metadata-dumps-build-time-name-resolution).
 
 The runtime resolver is additional functionality used inside an already-installed callback:
 

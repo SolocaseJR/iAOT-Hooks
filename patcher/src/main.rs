@@ -1,8 +1,10 @@
 mod analyzer;
 mod arm64;
+mod branding;
 mod caves;
 mod errors;
 mod generate;
+mod il2cpp_metadata;
 mod ipa;
 mod macho;
 mod manifest;
@@ -39,6 +41,10 @@ enum Cmd {
         manifest: PathBuf,
         #[arg(long)]
         force_authorized: bool,
+    },
+    ResolveConfig {
+        #[arg(long)]
+        manifest: PathBuf,
     },
     AnalyzeIpa {
         #[arg(long = "in")]
@@ -114,12 +120,9 @@ enum Cmd {
         binary: PathBuf,
     },
 }
-fn validated(path: &Path, force: bool) -> anyhow::Result<manifest::Manifest> {
+fn validated(path: &Path, _force: bool) -> anyhow::Result<manifest::Manifest> {
     let m = manifest::load(path)?;
-    manifest::validate(&m, force)?;
-    if force && !m.app.authorized_only {
-        eprintln!("WARNING: authorization metadata was overridden; only proceed with an app you are authorized to test.");
-    }
+    manifest::validate(&m, false)?;
     Ok(m)
 }
 fn print_patch_report(report: &macho::PatchReport) {
@@ -145,8 +148,72 @@ fn print_patch_report(report: &macho::PatchReport) {
     for failure in &report.failures {
         println!("{}: disabled safely: {}", failure.name, failure.reason);
     }
-    println!("patched {} authorized redirect(s); config=0x{:x}, caves=0x{:x}, removed {} stale code signature command(s){}",report.patches,report.config_vmaddr,report.cave_vmaddr,report.removed_code_signatures,if report.added_dylib_load_command{"; added embedded-dylib load command"}else{""});
+    let near = report
+        .near_cave_vmaddr
+        .map(|address| format!(", near-cave=0x{address:x}"))
+        .unwrap_or_default();
+    println!(
+        "patched {} redirect(s); config=0x{:x}, cave=0x{:x}{}, removed {} stale code signature command(s){}",
+        report.patches,
+        report.config_vmaddr,
+        report.cave_vmaddr,
+        near,
+        report.removed_code_signatures,
+        if report.added_dylib_load_command {
+            "; added embedded-dylib load command"
+        } else {
+            ""
+        }
+    );
 }
+
+#[derive(serde::Serialize)]
+struct ResolvedProjectConfig {
+    project_name: String,
+    source_dir: PathBuf,
+    input_ipa: Option<PathBuf>,
+    output_ipa: Option<PathBuf>,
+    build_dir: Option<PathBuf>,
+    generated_dir: Option<PathBuf>,
+    temp_dir: Option<PathBuf>,
+    build_mode: String,
+    dylib_name: String,
+    il2cpp_enabled: bool,
+}
+
+fn resolve_project_path(source_dir: &Path, value: Option<PathBuf>) -> Option<PathBuf> {
+    value.map(|path| {
+        if path.is_absolute() {
+            path
+        } else {
+            source_dir.join(path)
+        }
+    })
+}
+
+fn resolved_project_config(path: &Path) -> anyhow::Result<ResolvedProjectConfig> {
+    let configured = validated(path, false)?;
+    let source_dir = if configured.source_dir.is_absolute() {
+        configured.source_dir.clone()
+    } else {
+        std::env::current_dir()?.join(&configured.source_dir)
+    };
+    Ok(ResolvedProjectConfig {
+        project_name: configured.project.name,
+        input_ipa: resolve_project_path(&source_dir, configured.paths.input_ipa),
+        output_ipa: resolve_project_path(&source_dir, configured.paths.output_ipa),
+        build_dir: resolve_project_path(&source_dir, configured.paths.build_dir),
+        generated_dir: resolve_project_path(&source_dir, configured.paths.generated_dir),
+        temp_dir: resolve_project_path(&source_dir, configured.paths.temp_dir),
+        build_mode: configured.build.mode,
+        dylib_name: configured.runtime.dylib_name,
+        il2cpp_enabled: configured.analysis.runtime_il2cpp
+            || configured.analysis.static_il2cpp
+            || configured.analysis.scripting_backend == "il2cpp",
+        source_dir,
+    })
+}
+
 fn new_project(name: &str) -> anyhow::Result<()> {
     if !name
         .chars()
@@ -167,6 +234,17 @@ fn new_project(name: &str) -> anyhow::Result<()> {
             &format!("com.example.{}.target", name.to_ascii_lowercase()),
         );
     fs::write(&manifest_path, template_manifest)?;
+    let template_config = include_str!("../../templates/theos-dylib/configs.yaml")
+        .replace("ExampleHooks", name)
+        .replace(
+            "com.example.authorized.target",
+            &format!("com.example.{}.target", name.to_ascii_lowercase()),
+        );
+    fs::write(d.join("configs.yaml"), template_config)?;
+    fs::write(
+        d.join("il2cpp_config.yaml"),
+        include_str!("../../templates/theos-dylib/il2cpp_config.yaml"),
+    )?;
     fs::write(
         d.join("README.md"),
         "Authorized IAOT project. Compile all native behavior before signing.\n",
@@ -211,6 +289,12 @@ fn main() -> anyhow::Result<()> {
             let m = validated(&manifest, force_authorized)?;
             generate::generate(&m, &manifest)?;
             println!("generated files next to {}", manifest.display())
+        }
+        Cmd::ResolveConfig { manifest } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&resolved_project_config(&manifest)?)?
+            );
         }
         Cmd::AnalyzeIpa { input, reports } => {
             let report = analyzer::analyze_ipa(&input)?;

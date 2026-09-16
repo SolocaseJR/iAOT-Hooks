@@ -44,9 +44,55 @@ enum Capability : std::uint64_t {
   NativeMethodPointers = 1ull << 9
 };
 
+// Versioned, dump-derived bindings used when a shipping IL2CPP binary has
+// stripped the public il2cpp_* metadata API. The runtime creates stable
+// synthetic handles so the normal Find* APIs can still be used.
+struct OfflineClassBinding {
+  const char *module{nullptr};
+  const char *namespc{nullptr};
+  const char *name{nullptr};
+};
+struct OfflineMethodBinding {
+  const char *module{nullptr};
+  const char *namespc{nullptr};
+  const char *klass{nullptr};
+  const char *name{nullptr};
+  int parameterCount{-1};
+  std::uintptr_t rva{0};
+};
+struct OfflineFieldBinding {
+  const char *module{nullptr};
+  const char *namespc{nullptr};
+  const char *klass{nullptr};
+  const char *name{nullptr};
+  std::uintptr_t offset{0};
+  std::size_t size{sizeof(void *)};
+};
+struct OfflineInternalCallBinding {
+  const char *name{nullptr};
+  const char *module{nullptr};
+  std::uintptr_t rva{0};
+};
+struct OfflineMetadata {
+  const OfflineClassBinding *classes{nullptr};
+  std::size_t classCount{0};
+  const OfflineMethodBinding *methods{nullptr};
+  std::size_t methodCount{0};
+  const OfflineFieldBinding *fields{nullptr};
+  std::size_t fieldCount{0};
+  const OfflineInternalCallBinding *internalCalls{nullptr};
+  std::size_t internalCallCount{0};
+};
+
 struct Options {
   const char *moduleName{nullptr};
   double timeoutSeconds{20.0};
+  // Optional target-relative address of a generated UTF-16 string factory.
+  // This lets stripped Unity IL2CPP binaries create managed strings without
+  // exporting the il2cpp_string_new debugging API.
+  std::uintptr_t stringFactoryRva{0};
+  // Optional dump-derived metadata/address bindings for stripped builds.
+  const OfflineMetadata *offlineMetadata{nullptr};
 };
 
 using MethodPointerAdapter = std::uintptr_t (*)(const MethodInfo *method);
@@ -65,12 +111,23 @@ IAOT_EXPORT const Il2CppImage *FindImage(const char *assemblyOrImageName);
 IAOT_EXPORT Il2CppClass *FindClass(const char *assemblyOrImageName,
                                    const char *namespc, const char *name);
 IAOT_EXPORT Il2CppClass *FindNestedClass(Il2CppClass *parent, const char *name);
+IAOT_EXPORT Il2CppClass *GetParentClass(Il2CppClass *klass);
+// Returns the live managed class name when runtime IL2CPP metadata is
+// available. Offline class handles intentionally return nullptr.
+IAOT_EXPORT const char *ClassName(Il2CppClass *klass);
 IAOT_EXPORT const MethodInfo *FindMethod(Il2CppClass *klass, const char *name,
-                                         int parameterCount = -1);
+                                          int parameterCount = -1);
 IAOT_EXPORT FieldInfo *FindField(Il2CppClass *klass, const char *name);
 IAOT_EXPORT const PropertyInfo *FindProperty(Il2CppClass *klass,
                                              const char *name);
 IAOT_EXPORT std::uintptr_t NativeMethodPointer(const MethodInfo *method);
+// Resolves a generated dump binding directly by managed name. This is useful
+// for stripped players where a real MethodInfo cannot be obtained (notably
+// inherited generic singleton accessors), but a versioned offline RVA exists.
+IAOT_EXPORT std::uintptr_t
+OfflineMethodPointer(const char *assemblyOrImageName, const char *namespc,
+                     const char *klass, const char *name,
+                     int parameterCount = -1);
 IAOT_EXPORT Il2CppObject *Invoke(const MethodInfo *method,
                                  Il2CppObject *instance,
                                  void **arguments = nullptr,
@@ -81,6 +138,21 @@ namespace String {
 IAOT_EXPORT Il2CppString *New(const char *utf8);
 IAOT_EXPORT std::string ToUtf8(const Il2CppString *value);
 } // namespace String
+
+// A managed object created via String::New (or any other allocation) is not
+// automatically rooted just because a native pointer to it exists somewhere.
+// The GC has no visibility into native globals/statics, so an unrooted
+// object can be collected -- and its memory handed to the next managed
+// allocation -- as soon as a collection runs. Anything held across more than
+// one native call must be pinned with GC::Pin() first.
+namespace GC {
+// Roots and pins `object` so the collector will neither reclaim it nor move
+// it. Returns a handle to release later with Unpin(), or 0 if pinning is
+// unavailable (in which case the caller cannot safely cache the object).
+IAOT_EXPORT std::uint32_t Pin(Il2CppObject *object);
+IAOT_EXPORT Il2CppObject *GetTarget(std::uint32_t handle);
+IAOT_EXPORT void Unpin(std::uint32_t handle);
+} // namespace GC
 
 namespace Field {
 IAOT_EXPORT std::size_t Offset(const FieldInfo *field);

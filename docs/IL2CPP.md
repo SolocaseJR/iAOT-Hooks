@@ -45,6 +45,39 @@ When exports exist it supports:
 - `il2cpp_resolve_icall` for common UnityEngine APIs;
 - thread attachment where exported.
 
+### Stripped exported API fallback
+
+Shipping Unity IL2CPP builds can contain the complete managed-string runtime
+while omitting the public `il2cpp_string_new`/domain API exports. For that
+case, configure the audited RVA of the target's generated UTF-16
+`System.String.CreateString(Char*)` helper:
+
+```yaml
+runtime:
+  string_factory_rva: 0x8595F8C
+```
+
+The runtime first uses exported `il2cpp_string_new` when available. If it is
+absent, it converts UTF-8 to UTF-16 and calls the configured in-image factory.
+The RVA is target- and version-specific; it must come from an authorized dump
+and must not be guessed or copied between app versions. The generated runtime
+also normalizes `analysis.il2cpp_module: main` to the actual executable image
+name before starting module discovery.
+
+For heavily stripped or transformed builds, the offline resolver can consume
+the same kind of audited output produced by a Cpp2IL analysis package. The
+An audited metadata package can contain native method addresses plus managed
+field offsets. The generated bindings use those values
+to provide `FindClass`, `FindMethod`, `FindField`, typed method pointers, field
+access, and internal-call addresses without pretending that the public
+`il2cpp_*` exports exist. This follows the metadata-loader investigation model
+described in Katy's IL2CPP loader analysis: the app still initializes its own
+metadata cache; stripping only removes the convenient exported inspection API.
+
+The offline handles are deliberately versioned. A new binary must regenerate
+and audit the bindings; strings or a previous build's offsets are not a safe
+substitute.
+
 ```cpp
 auto* player = iaot::il2cpp::FindClass("Assembly-CSharp", "Example", "Player");
 auto* method = iaot::il2cpp::FindMethod(player, "GetDisplayName", 0);
@@ -52,7 +85,102 @@ auto* result = iaot::il2cpp::Invoke(method, instance);
 auto text = iaot::il2cpp::String::ToUtf8(reinterpret_cast<iaot::il2cpp::Il2CppString*>(result));
 ```
 
-No stable exported API returns a native `MethodInfo` function pointer on every Unity version. `NativeMethodPointer` therefore returns zero unless the user supplies an explicitly versioned `MethodPointerAdapter`. Runtime-installed hooks are not implemented. This is intentional for the jailed/no-JIT premise.
+No stable exported API returns a native `MethodInfo` function pointer on every
+Unity version. Without offline bindings, `NativeMethodPointer` therefore
+returns zero unless the user supplies an explicitly versioned
+`MethodPointerAdapter`. Runtime-installed hooks are not implemented. This is
+intentional for the jailed/no-JIT premise.
+
+## Offline metadata dumps (build-time name resolution)
+
+Hand-typing native RVAs and struct field offsets into a manifest is fragile: a
+game update shifts every address and the stale numbers fail silently. Instead,
+point the manifest at a **metadata dump** produced by an offline static-analysis
+tool and let `iaot generate` resolve every offline entry **by name**. The
+resolved numbers are baked into the generated offline tables; a moved address
+then surfaces as a loud `method ... not found` / `is ambiguous` error at build
+time rather than a silent runtime failure.
+
+The split layout keeps these keys under `runtime:` in
+`il2cpp_config.yaml`:
+
+```yaml
+runtime:
+  # A directory or a single file. Format is auto-detected from the file names.
+  metadata_package: "Game Data & Dumps/Cpp2IL_AnalysisPackage"
+  # Optional override: auto (default) | cpp2il | il2cpp_dumper
+  metadata_format: auto
+```
+
+The file is selected from `configs.yaml`:
+
+```yaml
+il2cpp:
+  enabled: true
+  config_file: il2cpp_config.yaml
+```
+
+When `enabled` is false, IAOT does not open the IL2CPP config or its metadata
+package.
+
+Any `offline_methods`, `offline_fields`, `offline_internal_calls`, and
+`string_factory` entry may then be **name-only** (no `rva:` / `offset:`). An
+explicit value in the manifest always wins over dump resolution, so you can pin
+a single tricky entry by hand while resolving the rest by name.
+
+### Supported dump formats
+
+You only need a **small subset** of a tool's output — usually one or two files.
+
+**Cpp2IL analysis package** (`--output-as=analysis-package`; recommended, and the
+format iAOT is primarily tested against). Provide the directory or either file:
+
+| File | Provides | Needed when |
+| --- | --- | --- |
+| `cpp2il_methods.jsonl` | method native addresses, assembly, declaring type, parameter types | any `offline_methods` / `offline_internal_calls` / `string_factory` |
+| `cpp2il_types.jsonl` | per-field name, offset, size | any `offline_fields` |
+
+The rest of the package (`cpp2il_calls.jsonl`, `cpp2il_pseudocode.jsonl`, the
+`.h` headers, the IDA/Ghidra `.py` scripts) is **not read** — ship only the two
+`.jsonl` files. This format carries assemblies and managed parameter types, so
+it is the only one that can disambiguate overloads by `parameter_types`.
+
+**Il2CppDumper** (Perfare's tool — "the IDA/Ghidra dump"). Provide the directory
+or a single file:
+
+| File | Provides | Needed when |
+| --- | --- | --- |
+| `script.json` | method addresses keyed by `Type$$Method` (the file its `ida.py`/`ghidra.py` consume) | `offline_methods` / most `offline_internal_calls` |
+| `dump.cs` | methods **and** instance field offsets (`// RVA: 0x..`, `// 0x..`) | `offline_fields` (script.json has none), or methods without a script.json |
+
+If both files are present, `script.json` supplies methods and `dump.cs` supplies
+field offsets. If a project has `offline_fields` but the folder has only
+`script.json`, `iaot generate` fails with an explicit message telling you to add
+`dump.cs`, switch to a Cpp2IL package, or hand-specify the offsets.
+
+Because `script.json`/`dump.cs` carry no managed assembly names and no managed
+parameter types, overloads are disambiguated only by `parameter_count`, and the
+`INTERNAL_CALL_*` internal-call thunk names (a Cpp2IL concept) resolve only via
+their plain method name. Use a Cpp2IL package when you need that precision.
+
+### The RVA convention (important)
+
+Every RVA produced is `native_VA - 0x1_0000_0000` (relative to the arm64 image
+base, i.e. the main executable's `__TEXT` vmaddr); the runtime adds the real
+load slide. This is deliberately **not** the Cpp2IL `rva` JSON field, which is
+relative to the tool's `primaryExecutableAddress` (past the Mach-O header) and
+would be short by the header size — iAOT recomputes from the absolute `address`.
+Il2CppDumper's `Address`/`RVA` are already image-base-relative and used as-is.
+
+The implementation and its unit tests live in
+[`patcher/src/il2cpp_metadata.rs`](../patcher/src/il2cpp_metadata.rs).
+
+### Regenerate per game version
+
+Offline handles are deliberately version-specific. A new binary must regenerate
+and re-audit the dump; a previous build's addresses or another app's dump are
+never a safe substitute. The dumps are large (hundreds of MB) and are kept out
+of the framework — regenerate them per game version with your analyzer.
 
 ## Compatibility and degradation
 

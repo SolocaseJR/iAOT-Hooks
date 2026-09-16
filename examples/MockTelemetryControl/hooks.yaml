@@ -1,0 +1,127 @@
+schema_version: 2
+
+project:
+  name: MockTelemetryControl
+  bundle_id: com.example.owned.mock-telemetry
+  platform: ios
+  arch: arm64
+  min_ios: "14.0"
+
+runtime:
+  config_segment: "__IAOTCFG"
+  cave_segment: "__IAOTCAVE"
+  page_size: 16384
+  dylib_name: "MockTelemetryControl.dylib"
+
+app:
+  executable_member: Payload/MockTelemetry.app/MockTelemetry
+  prefer_unity_framework: false
+
+build:
+  mode: development
+  log_level: info
+  menu: true
+  persistence: true
+  runtime_autostart: true
+  signing: external
+
+analysis:
+  application_type: mixed_native
+  scripting_backend: native
+  rendering_backend: metal
+  static_il2cpp: false
+  runtime_il2cpp: false
+
+config:
+  flags:
+  - name: disable_mock_transport
+    index: 0
+    default: true
+  strings: []
+
+functions: []
+generated_hooks:
+- name: MockUserHooks
+  symbol: IAOT_InstallMockUserHooks
+
+# Deliberately impossible fixture RVAs keep this example inert unless it is
+# adapted to an owned synthetic binary with a matching address layout.
+patches:
+- name: MockAnoSDKGetReportData
+  enabled: true
+  description: Synthetic native SDK report-data provider returning zero
+  replacement: IAOT_MockAnoSDKGetReportData
+  signature: std::int64_t(int)
+  module: Payload/MockTelemetry.app/Frameworks/MockAnoSDK.framework/MockAnoSDK
+  failure_behavior: disable_hook
+  locator: { type: rva, value: 0x7FFF00001000 }
+  patch: { type: branch_to_cave }
+  expect: auto
+
+- name: MockAnoSDKGetReportData2
+  enabled: true
+  description: Synthetic native SDK report-data provider returning zero
+  replacement: IAOT_MockAnoSDKGetReportData2
+  signature: std::int64_t(int)
+  module: Payload/MockTelemetry.app/Frameworks/MockAnoSDK.framework/MockAnoSDK
+  failure_behavior: disable_hook
+  locator: { type: rva, value: 0x7FFF00002000 }
+  patch: { type: branch_to_cave }
+  expect: auto
+
+- name: MockAnoSDKGetReportData3
+  enabled: true
+  description: Synthetic native SDK report-data provider returning zero
+  replacement: IAOT_MockAnoSDKGetReportData3
+  signature: std::int64_t(int)
+  module: Payload/MockTelemetry.app/Frameworks/MockAnoSDK.framework/MockAnoSDK
+  failure_behavior: disable_hook
+  locator: { type: rva, value: 0x7FFF00003000 }
+  patch: { type: branch_to_cave }
+  expect: auto
+
+- name: MockAnoSDKGetReportData4
+  enabled: true
+  description: Synthetic analogue of a native GetReportData4 wrapper returning zero before dispatch
+  replacement: IAOT_MockAnoSDKGetReportData4
+  signature: std::int64_t(int)
+  module: anogs
+  failure_behavior: disable_hook
+  locator: { type: rva, value: 0x7FFF00004000 }
+  patch: { type: branch_to_cave }
+  expect: auto
+
+- name: MockEnableGameReport
+  enabled: true
+  description: Synthetic report-enablement routine implemented as a no-op
+  replacement: IAOT_MockEnableGameReport
+  signature: void(const void*)
+  module: main
+  failure_behavior: disable_hook
+  locator: { type: rva, value: 0x7FFF00005000 }
+  patch: { type: branch_to_cave }
+  expect: auto
+
+- name: MockSendDataToServer
+  enabled: true
+  description: Synthetic transport controlled by the Account-tab checkbox
+  replacement: IAOT_MockSendDataToServer
+  signature: void(void*, const void*)
+  preserve_original: true
+  module: main
+  failure_behavior: disable_hook
+  locator: { type: rva, value: 0x7FFF00006000 }
+  patch: { type: branch_to_cave }
+  expect: auto
+
+- name: MockSendDiagnosticInfo
+  enabled: true
+  description: Second synthetic transport controlled by the Account-tab checkbox
+  replacement: IAOT_MockSendDiagnosticInfo
+  signature: void(void*, const void*)
+  preserve_original: true
+  module: main
+  failure_behavior: disable_hook
+  locator: { type: rva, value: 0x7FFF00007000 }
+  patch: { type: branch_to_cave }
+  expect: auto

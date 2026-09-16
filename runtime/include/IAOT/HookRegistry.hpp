@@ -20,7 +20,16 @@ struct HookDiagnostic {
 };
 IAOT_EXPORT bool RegisterHook(const HookEntry &entry);
 IAOT_EXPORT bool InstallAllHooks(const HookContext &ctx);
+// Re-run install ONLY for hooks currently in HookStatus::Failed. A class may
+// become available after its first installation attempt.
+// Already-Ready hooks are never reinstalled, so handlers that captured an
+// original IMP cannot be chained onto themselves. Returns true if none remain
+// failed.
+IAOT_EXPORT bool RetryFailedHooks(const HookContext &ctx);
 IAOT_EXPORT std::size_t GetRegisteredHookCount();
+// Current installer outcomes, not evidence that callbacks executed. An empty
+// registry is ready. Registered, Installing, and Failed entries are not ready.
+IAOT_EXPORT bool AreRegisteredHooksReady();
 IAOT_EXPORT HookDiagnostic GetHookDiagnostic(std::size_t index);
 IAOT_EXPORT void RegisterGeneratedHooks();
 namespace detail {

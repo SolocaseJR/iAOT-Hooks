@@ -6,7 +6,7 @@ pub struct CaveRequest<'a> {
     pub cave_address: u64,
     pub return_address: u64,
     pub original_address: u64,
-    pub displaced: u32,
+    pub displaced: &'a [u32],
     pub config_address: u64,
     pub flag_index: Option<u32>,
     pub callback_index: Option<u32>,
@@ -33,12 +33,25 @@ fn load_config(
 }
 fn branch_back(out: &mut Vec<u8>, req: &CaveRequest<'_>) -> Result<(), IaotError> {
     let now = pc(req, out);
-    put(out, arm64::b(now, req.return_address)?);
+    if let Ok(branch) = arm64::b(now, req.return_address) {
+        put(out, branch);
+    } else {
+        for instruction in arm64::long_branch(now, req.return_address)? {
+            put(out, instruction);
+        }
+    }
     Ok(())
 }
 fn normal(out: &mut Vec<u8>, req: &CaveRequest<'_>) -> Result<(), IaotError> {
-    for instruction in arm64::relocate(req.displaced, req.original_address, pc(req, out))? {
-        put(out, instruction);
+    for (index, instruction) in req.displaced.iter().copied().enumerate() {
+        let relocated = arm64::relocate(
+            instruction,
+            req.original_address + (index as u64) * 4,
+            pc(req, out),
+        )?;
+        for instruction in relocated {
+            put(out, instruction);
+        }
     }
     branch_back(out, req)
 }
@@ -176,10 +189,7 @@ pub fn build(req: &CaveRequest<'_>) -> Result<Vec<u8>, IaotError> {
                 .copy_from_slice(&arm64::cbz(17, at, normal_addr, false)?.to_le_bytes());
         }
         PatchAction::CallbackAfter { .. } => {
-            for instruction in arm64::relocate(req.displaced, req.original_address, pc(req, &out))?
-            {
-                put(&mut out, instruction);
-            }
+            normal(&mut out, req)?;
             callback_call(&mut out, req, req.callback_index.unwrap())?;
             branch_back(&mut out, req)?;
         }
@@ -223,14 +233,28 @@ pub fn build(req: &CaveRequest<'_>) -> Result<Vec<u8>, IaotError> {
 pub fn build_original_trampoline(
     cave_address: u64,
     original_address: u64,
-    displaced: u32,
+    displaced: &[u32],
 ) -> Result<Vec<u8>, IaotError> {
     let mut out = Vec::new();
-    for instruction in arm64::relocate(displaced, original_address, cave_address)? {
-        put(&mut out, instruction);
+    for (index, instruction) in displaced.iter().copied().enumerate() {
+        let relocated = arm64::relocate(
+            instruction,
+            original_address + (index as u64) * 4,
+            cave_address + out.len() as u64,
+        )?;
+        for instruction in relocated {
+            put(&mut out, instruction);
+        }
     }
     let branch_pc = cave_address + out.len() as u64;
-    put(&mut out, arm64::b(branch_pc, original_address + 4)?);
+    let return_address = original_address + (displaced.len() as u64) * 4;
+    if let Ok(branch) = arm64::b(branch_pc, return_address) {
+        put(&mut out, branch);
+    } else {
+        for instruction in arm64::long_branch(branch_pc, return_address)? {
+            put(&mut out, instruction);
+        }
+    }
     Ok(out)
 }
 
@@ -247,17 +271,17 @@ mod tests {
             },
             PatchAction::CallbackIfFlag {
                 flag: "f".into(),
-                callback: "c".into(),
+                callback: Some("c".into()),
             },
             PatchAction::CallbackReturnZeroIfFlag {
                 flag: "f".into(),
-                callback: "c".into(),
+                callback: Some("c".into()),
             },
             PatchAction::CallbackAfter {
-                callback: "c".into(),
+                callback: Some("c".into()),
             },
             PatchAction::BranchToCallback {
-                callback: "c".into(),
+                callback: Some("c".into()),
             },
             PatchAction::BranchToReplacement { symbol: "r".into() },
         ];
@@ -267,7 +291,7 @@ mod tests {
                 cave_address: 0x1_0000_8000,
                 return_address: 0x1_0000_0404,
                 original_address: 0x1_0000_0400,
-                displaced: 0xd503201f,
+                displaced: &[0xd503201f],
                 config_address: 0x1_0000_4000,
                 flag_index: Some(0),
                 callback_index: Some(0),
@@ -281,7 +305,7 @@ mod tests {
     }
     #[test]
     fn builds_callable_original() {
-        let bytes = build_original_trampoline(0x1_0000_9000, 0x1_0000_0400, 0xd503201f).unwrap();
+        let bytes = build_original_trampoline(0x1_0000_9000, 0x1_0000_0400, &[0xd503201f]).unwrap();
         assert_eq!(bytes.len(), 8);
     }
 }

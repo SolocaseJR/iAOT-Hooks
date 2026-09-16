@@ -22,6 +22,13 @@ pub fn b(pc: u64, target: u64) -> Result<u32, IaotError> {
     }
     Ok(0x1400_0000 | (((delta >> 2) as i64 as u32) & 0x03ff_ffff))
 }
+pub fn long_branch(pc: u64, target: u64) -> Result<[u32; 3], IaotError> {
+    Ok([
+        adrp(16, pc, target)?,
+        add_imm(16, 16, (target & 0xfff) as u16, true)?,
+        br(16)?,
+    ])
+}
 pub fn bl(pc: u64, target: u64) -> Result<u32, IaotError> {
     Ok((b(pc, target)? & 0x03ff_ffff) | 0x9400_0000)
 }
@@ -165,6 +172,41 @@ fn branch_target(pc: u64, encoded: u64, bits: u8, scale: u8) -> u64 {
     (pc as i128 + ((sign_extend(encoded, bits) as i128) << scale)) as u64
 }
 
+/// Decode the destination encoded by an ARM64 immediate branch instruction.
+///
+/// Supported families are B/BL, B.cond, CBZ/CBNZ, and TBZ/TBNZ. The returned
+/// address is calculated from the instruction's own PC, so callers do not need
+/// a separately maintained target RVA.
+pub fn encoded_branch_target(instruction: u32, pc: u64) -> Result<u64, IaotError> {
+    if !pc.is_multiple_of(4) {
+        return Err(IaotError::Unsupported(
+            "branch instruction address must be aligned".into(),
+        ));
+    }
+    if instruction & 0x7c00_0000 == 0x1400_0000 {
+        return Ok(branch_target(pc, (instruction & 0x03ff_ffff) as u64, 26, 2));
+    }
+    if instruction & 0xff00_0010 == 0x5400_0000 || instruction & 0x7e00_0000 == 0x3400_0000 {
+        return Ok(branch_target(
+            pc,
+            ((instruction >> 5) & 0x7ffff) as u64,
+            19,
+            2,
+        ));
+    }
+    if instruction & 0x7e00_0000 == 0x3600_0000 {
+        return Ok(branch_target(
+            pc,
+            ((instruction >> 5) & 0x3fff) as u64,
+            14,
+            2,
+        ));
+    }
+    Err(IaotError::Unsupported(
+        "instruction does not encode a supported immediate branch target".into(),
+    ))
+}
+
 /// Relocate one ARM64 instruction from `original_pc` to `new_pc`.
 ///
 /// The offline bridge currently displaces exactly one instruction. Supported
@@ -256,6 +298,9 @@ mod tests {
         assert_eq!(b(0x1004, 0x1000).unwrap(), 0x17ffffff);
         assert!(b(1, 4).is_err());
         assert!(b(0, 0x8000000).is_err());
+        assert_eq!(encoded_branch_target(0x34000020, 0x1000).unwrap(), 0x1004);
+        assert_eq!(encoded_branch_target(0x35ffffe0, 0x1000).unwrap(), 0x0ffc);
+        assert!(encoded_branch_target(0xa9007fff, 0x1000).is_err());
     }
     #[test]
     fn relocates_pc_relative_families() {

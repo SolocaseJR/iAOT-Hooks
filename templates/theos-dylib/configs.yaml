@@ -1,0 +1,49 @@
+schema_version: 1
+
+project:
+  name: ExampleHooks
+  bundle_id: com.example.authorized.target
+  platform: ios
+  arch: arm64
+  min_ios: "14.0"
+
+paths:
+  input_ipa: null
+  output_ipa: build/ExampleHooks-unsigned.ipa
+  build_dir: build
+  generated_dir: generated/reports
+  temp_dir: build/temp
+
+build:
+  mode: development
+  log_level: info
+  menu: true
+  persistence: true
+  runtime_autostart: true
+  minimal_runtime: false
+  clean_temporary: true
+  signing: external
+
+analysis:
+  application_type: auto
+  rendering_backend: auto
+
+runtime:
+  config_segment: "__IAOTCFG"
+  cave_segment: "__IAOTCAVE"
+  page_size: 16384
+  dylib_name: "ExampleHooks.dylib"
+
+app:
+  executable_member: null
+  prefer_unity_framework: true
+  target_module: null
+  # Optional SpringBoard branding. The icon must be a square PNG (1024x1024 recommended).
+  display_name: null
+  icon_path: null
+  authorized_only: true
+
+# il2cpp_config.yaml is not opened at all when enabled is false.
+il2cpp:
+  enabled: true
+  config_file: il2cpp_config.yaml

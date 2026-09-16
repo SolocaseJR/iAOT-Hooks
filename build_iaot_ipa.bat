@@ -2,14 +2,16 @@
 setlocal
 cd /d "%~dp0"
 if "%~1"=="" (
-  echo Usage: drag a decrypted IPA onto build_iaot_ipa.bat
-  echo        build_iaot_ipa.bat "C:\path with spaces\OwnedApp.ipa" [hooks.yaml]
+  echo Usage: build_iaot_ipa.bat hooks.yaml [decrypted-input.ipa]
   exit /b 2
 )
-set "IAOT_INPUT=%~f1"
-set "IAOT_MANIFEST=%~f2"
-if not defined IAOT_MANIFEST set "IAOT_MANIFEST=%~dp0templates\theos-dylib\hooks.yaml"
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-iaot.ps1" -InputIpa "%IAOT_INPUT%" -Manifest "%IAOT_MANIFEST%"
+set "IAOT_MANIFEST=%~f1"
+set "IAOT_INPUT=%~f2"
+if defined IAOT_INPUT (
+  powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-iaot.ps1" -Manifest "%IAOT_MANIFEST%" -InputIpa "%IAOT_INPUT%"
+) else (
+  powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-iaot.ps1" -Manifest "%IAOT_MANIFEST%"
+)
 set "IAOT_EXIT=%ERRORLEVEL%"
 if not "%IAOT_EXIT%"=="0" (
   echo.

@@ -74,12 +74,12 @@ bool IsExecutableAddress(std::uintptr_t v) {
   vm_region_basic_info_data_64_t info{};
   mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
   mach_port_t object{};
-  mach_vm_address_t address = v;
-  mach_vm_size_t size{};
-  return mach_vm_region(mach_task_self(), &address, &size,
-                        VM_REGION_BASIC_INFO_64,
-                        reinterpret_cast<vm_region_info_t>(&info), &count,
-                        &object) == KERN_SUCCESS &&
+  vm_address_t address = v;
+  vm_size_t size{};
+  return vm_region_64(mach_task_self(), &address, &size,
+                      VM_REGION_BASIC_INFO_64,
+                      reinterpret_cast<vm_region_info_t>(&info), &count,
+                      &object) == KERN_SUCCESS &&
          (info.protection & VM_PROT_EXECUTE) != 0;
 #else
   return v != 0;

@@ -15,6 +15,8 @@ struct HookContext {
   const char *executableName{};
   RuntimeConfig *config{};
 };
+// Initial setup runs once; the return value reflects current registered
+// installer health, including subsequent retries. It does not prove execution.
 IAOT_EXPORT bool Initialize();
 IAOT_EXPORT bool IsInitialized();
 IAOT_EXPORT const HookContext &GetContext();

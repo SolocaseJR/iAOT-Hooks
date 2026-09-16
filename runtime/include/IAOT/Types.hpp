@@ -2,9 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#ifndef OBF
-#define OBF(x) x
-#endif
+#include "IAOT/Obf.hpp"
 
 #if defined(_MSC_VER)
 #define IAOT_INLINE __forceinline

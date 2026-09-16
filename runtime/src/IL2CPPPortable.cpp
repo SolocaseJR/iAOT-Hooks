@@ -15,6 +15,8 @@ Il2CppClass *FindClass(const char *, const char *, const char *) {
   return nullptr;
 }
 Il2CppClass *FindNestedClass(Il2CppClass *, const char *) { return nullptr; }
+Il2CppClass *GetParentClass(Il2CppClass *) { return nullptr; }
+const char *ClassName(Il2CppClass *) { return nullptr; }
 const MethodInfo *FindMethod(Il2CppClass *, const char *, int) {
   return nullptr;
 }
@@ -23,6 +25,10 @@ const PropertyInfo *FindProperty(Il2CppClass *, const char *) {
   return nullptr;
 }
 std::uintptr_t NativeMethodPointer(const MethodInfo *) { return 0; }
+std::uintptr_t OfflineMethodPointer(const char *, const char *, const char *,
+                                    const char *, int) {
+  return 0;
+}
 Il2CppObject *Invoke(const MethodInfo *, Il2CppObject *, void **,
                      Il2CppException **) {
   return nullptr;
@@ -32,6 +38,11 @@ namespace String {
 Il2CppString *New(const char *) { return nullptr; }
 std::string ToUtf8(const Il2CppString *) { return {}; }
 } // namespace String
+namespace GC {
+std::uint32_t Pin(Il2CppObject *) { return 0; }
+Il2CppObject *GetTarget(std::uint32_t) { return nullptr; }
+void Unpin(std::uint32_t) {}
+} // namespace GC
 namespace Field {
 std::size_t Offset(const FieldInfo *) { return 0; }
 bool GetStatic(const FieldInfo *, void *) { return false; }

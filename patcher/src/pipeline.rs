@@ -1,5 +1,5 @@
 use crate::{
-    analyzer, generate, ipa, macho,
+    analyzer, branding, generate, ipa, macho,
     manifest::{self, Manifest},
 };
 use serde::Serialize;
@@ -45,6 +45,8 @@ struct ValidationReport {
     output_size: u64,
     executable_member: String,
     runtime_dylib_member: String,
+    display_name: Option<String>,
+    custom_icon_members: Vec<String>,
     runtime_dylib_present: bool,
     load_command_present: bool,
     patched_modules: Vec<String>,
@@ -101,6 +103,21 @@ fn resolve_module(report: &analyzer::IpaAnalysis, value: &str) -> anyhow::Result
         [] => anyhow::bail!("configured module '{value}' was not found"),
         _ => anyhow::bail!("configured module '{value}' is ambiguous"),
     }
+}
+
+/// Resolve a configured IL2CPP module (e.g. `main`) to its runtime image name -
+/// the basename of the resolved member path - so the generated config carries
+/// the actual executable image name rather than a manifest alias.
+fn runtime_module_name(report: &analyzer::IpaAnalysis, value: &str) -> anyhow::Result<String> {
+    let member = resolve_module(report, value)?;
+    member
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!("resolved IL2CPP module has no runtime image name: {member}")
+        })
 }
 
 fn default_patch_module(
@@ -174,7 +191,24 @@ fn apply_analysis_overrides(
     report.unity.runtime_resolver = if report.unity.scripting_backend != "il2cpp" {
         "not_applicable".into()
     } else if manifest.analysis.runtime_il2cpp {
-        "iaot_exported_api_resolver".into()
+        if manifest.runtime.string_factory_rva.is_some()
+            && (!manifest.runtime.offline_classes.is_empty()
+                || !manifest.runtime.offline_methods.is_empty()
+                || !manifest.runtime.offline_fields.is_empty()
+                || !manifest.runtime.offline_internal_calls.is_empty())
+        {
+            "iaot_exported_api_resolver+offline_metadata+static_utf16_string_factory".into()
+        } else if !manifest.runtime.offline_classes.is_empty()
+            || !manifest.runtime.offline_methods.is_empty()
+            || !manifest.runtime.offline_fields.is_empty()
+            || !manifest.runtime.offline_internal_calls.is_empty()
+        {
+            "iaot_exported_api_resolver+offline_metadata".into()
+        } else if manifest.runtime.string_factory_rva.is_some() {
+            "iaot_exported_api_resolver+static_utf16_string_factory".into()
+        } else {
+            "iaot_exported_api_resolver".into()
+        }
     } else {
         "disabled".into()
     };
@@ -453,7 +487,9 @@ pub fn prepare(manifest_path: &Path, input_ipa: &Path, reports: &Path) -> anyhow
     )?;
     let mut effective = manifest.clone();
     effective.analysis.runtime_il2cpp &= analysis.unity.scripting_backend == "il2cpp";
-    if effective.analysis.il2cpp_module.is_none() {
+    if let Some(configured) = effective.analysis.il2cpp_module.clone() {
+        effective.analysis.il2cpp_module = Some(runtime_module_name(&analysis, &configured)?);
+    } else {
         effective.analysis.il2cpp_module = analysis
             .unity
             .il2cpp_module
@@ -503,7 +539,10 @@ pub fn run(options: PipelineOptions<'_>) -> anyhow::Result<()> {
     println!("[2/8] Validating configuration and generating C++ glue");
     let mut generated_manifest = manifest.clone();
     generated_manifest.analysis.runtime_il2cpp &= analysis.unity.scripting_backend == "il2cpp";
-    if generated_manifest.analysis.il2cpp_module.is_none() {
+    if let Some(configured) = generated_manifest.analysis.il2cpp_module.clone() {
+        generated_manifest.analysis.il2cpp_module =
+            Some(runtime_module_name(&analysis, &configured)?);
+    } else {
         generated_manifest.analysis.il2cpp_module = analysis
             .unity
             .il2cpp_module
@@ -548,11 +587,34 @@ pub fn run(options: PipelineOptions<'_>) -> anyhow::Result<()> {
     };
     let extracted = workspace.join("extracted");
     ipa::extract_all(options.input_ipa, &extracted)?;
+    let branding_artifacts = branding::prepare(
+        &manifest,
+        &analysis.app_bundle,
+        &analysis.info_plist_member,
+        &extracted,
+        &workspace.join("branding"),
+    )?;
+    if branding_artifacts.display_name.is_some() || !branding_artifacts.icon_members.is_empty() {
+        println!(
+            "  branding: display_name={} custom_icons={}",
+            branding_artifacts
+                .display_name
+                .as_deref()
+                .unwrap_or("unchanged"),
+            branding_artifacts.icon_members.len()
+        );
+    }
 
     println!("[4/8] Resolving hook targets and applying static ARM64 bridges");
     let patched_dir = workspace.join("patched");
     let patched = patch_extracted_modules(&manifest, &analysis, &extracted, &patched_dir, true)?;
-    let replacement_files = patched.replacement_files;
+    let patched_module_members = patched
+        .replacement_files
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let mut replacement_files = patched.replacement_files;
+    replacement_files.extend(branding_artifacts.replacements.iter().cloned());
     let applied_hooks = patched.applied_hooks;
     let disabled_hooks = patched.disabled_hooks;
 
@@ -584,19 +646,25 @@ pub fn run(options: PipelineOptions<'_>) -> anyhow::Result<()> {
         .iter()
         .map(|(name, path)| (name.as_str(), path.as_path()))
         .collect::<Vec<_>>();
+    let mut addition_refs = branding_artifacts
+        .additions
+        .iter()
+        .map(|(name, path)| (name.as_str(), path.as_path()))
+        .collect::<Vec<_>>();
+    addition_refs.push((dylib_member.as_str(), dylib));
     let staged_ipa = workspace.join("validated-output.ipa");
     ipa::repack_many(
         options.input_ipa,
         &staged_ipa,
         &replacement_refs,
-        &[(dylib_member.as_str(), dylib)],
+        &addition_refs,
     )?;
 
     println!("[7/8] Reopening and structurally validating the final IPA");
     let final_analysis = analyzer::analyze_ipa(&staged_ipa)?;
     let final_extract = workspace.join("final-validation");
     ipa::extract_all(&staged_ipa, &final_extract)?;
-    for (member, _) in &replacement_files {
+    for member in &patched_module_members {
         macho::verify(&final_extract.join(Path::new(member)))?;
     }
     let dylib_output = final_extract.join(Path::new(&dylib_member));
@@ -620,6 +688,19 @@ pub fn run(options: PipelineOptions<'_>) -> anyhow::Result<()> {
     if !load_command_present {
         anyhow::bail!("final main executable does not load the injected runtime dylib")
     }
+    if let Some(expected) = &branding_artifacts.display_name {
+        if final_analysis.display_name.as_deref() != Some(expected.as_str()) {
+            anyhow::bail!(
+                "final IPA display name mismatch: expected {expected:?}, got {:?}",
+                final_analysis.display_name
+            )
+        }
+    }
+    for member in &branding_artifacts.icon_members {
+        if !final_extract.join(Path::new(member)).is_file() {
+            anyhow::bail!("final IPA is missing generated app icon {member}")
+        }
+    }
 
     println!("[8/8] Writing patch and validation manifests");
     std::fs::create_dir_all(&reports)?;
@@ -632,12 +713,11 @@ pub fn run(options: PipelineOptions<'_>) -> anyhow::Result<()> {
         output_size: std::fs::metadata(options.output_ipa)?.len(),
         executable_member: analysis.executable_member.clone(),
         runtime_dylib_member: dylib_member,
+        display_name: final_analysis.display_name.clone(),
+        custom_icon_members: branding_artifacts.icon_members,
         runtime_dylib_present: dylib_present,
         load_command_present,
-        patched_modules: replacement_files
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect(),
+        patched_modules: patched_module_members,
         applied_hooks,
         disabled_hooks,
         structural_validation: "passed".into(),

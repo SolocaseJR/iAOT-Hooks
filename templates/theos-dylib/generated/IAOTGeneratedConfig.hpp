@@ -9,10 +9,10 @@ enum class IAOTFlag : std::uint32_t {
 enum class IAOTString : std::uint32_t {
 };
 enum class IAOTCallback : std::uint32_t {
-    example_hook_callback = 0,
+    ExampleHook = 0,
 };
 inline constexpr bool IAOTDefaultFlag_example_hook_enabled = false;
-inline constexpr const char* IAOTCallbackSymbol_example_hook_callback = OBF("IAOT_ExampleHook");
+inline const char* IAOTCallbackSymbol_ExampleHook = OBF("IAOT_ExampleHook");
 inline bool IAOTGetFlag(IAOTFlag v){return iaot::GetBool(static_cast<std::uint32_t>(v));}
 inline void IAOTSetFlag(IAOTFlag v,bool x){iaot::SetBool(static_cast<std::uint32_t>(v),x);}
 inline const char* IAOTGetString(IAOTString v){return iaot::GetString(static_cast<std::uint32_t>(v));}

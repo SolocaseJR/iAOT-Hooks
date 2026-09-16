@@ -4,6 +4,7 @@
 #if !defined(IAOT_ENABLE_OVERLAY) || !IAOT_ENABLE_OVERLAY
 namespace iaot {
 namespace {
+OverlayDrawFn g_backgroundDrawCallback = nullptr;
 OverlayDrawFn g_drawCallback = nullptr;
 }
 bool StartOverlay(const OverlayOptions &options) {
@@ -12,10 +13,25 @@ bool StartOverlay(const OverlayOptions &options) {
   return false;
 }
 void StopOverlay() {}
+OverlayStatus GetOverlayStatus() { return OverlayStatus::Unavailable; }
+void SetOverlayBackgroundDrawCallback(OverlayDrawFn callback) {
+  g_backgroundDrawCallback = callback;
+}
 void SetOverlayDrawCallback(OverlayDrawFn callback) {
   g_drawCallback = callback;
 }
 bool IsOverlayVisible() { return false; }
 void SetOverlayVisible(bool visible) { IAOT_UNUSED(visible); }
+void SetOverlayCaptureHidden(bool hidden) { IAOT_UNUSED(hidden); }
+bool IsOverlayCaptureWindow(const void *window) {
+  IAOT_UNUSED(window);
+  return false;
+}
+void SetOverlayLauncherAppearance(u32 background, u32 accent, float opacity) {
+  IAOT_UNUSED(background);
+  IAOT_UNUSED(accent);
+  IAOT_UNUSED(opacity);
+}
+void SetOverlayLauncherIconVariant(u32 variant) { IAOT_UNUSED(variant); }
 } // namespace iaot
 #endif

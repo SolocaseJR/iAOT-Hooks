@@ -8,7 +8,14 @@
 - `IAOTGeneratedProject.hpp`: menu, persistence, renderer, and IL2CPP target settings.
 - `IAOTGeneratedProject.mk`: authoritative build mode plus Theos overlay enablement/backend derived from centralized configuration.
 - `IAOTGeneratedHooks.mm`: explicit callback/resolver/user registration.
-- `hook-manifest.yaml`: machine-readable configured hook summary.
+- `hook-manifest.yaml`: machine-readable configured hook summary, including
+  generated installer names, symbols, and enabled states.
+
+The runtime's `[IAOTProfile]` line counts configured enabled static patches,
+Objective-C hooks, user installers, and auto-registered callback slots. These
+are separate categories, not a combined executed-hook count. Installer `Ready`
+status only reports successful registration/installation; it does not prove
+that a patched function has executed or that a server accepted its output.
 
 Report directories contain analysis and validation artifacts. `hook-preflight.yaml` proves that target resolution, bridge/trampoline construction, and load-command space checks passed before the runtime build. `il2cpp-methods.yaml` is created as an empty audited adapter skeleton and is not overwritten when it already exists.
 

@@ -13,19 +13,19 @@ fn put64(data: &mut [u8], offset: usize, value: u64) {
     data[offset..offset + 8].copy_from_slice(&value.to_le_bytes())
 }
 fn macho_fixture(filetype: u32) -> Vec<u8> {
-    let mut d = vec![0u8; 0x1000];
+    let mut d = vec![0u8; 0x5000];
     put32(&mut d, 0, 0xfeedfacf);
     put32(&mut d, 4, 0x0100000c);
     put32(&mut d, 12, filetype);
-    put32(&mut d, 16, 2);
-    put32(&mut d, 20, 168);
+    put32(&mut d, 16, 3);
+    put32(&mut d, 20, 240);
     let p = 32;
     put32(&mut d, p, 0x19);
     put32(&mut d, p + 4, 152);
     d[p + 8..p + 14].copy_from_slice(b"__TEXT");
     put64(&mut d, p + 24, 0x1_0000_0000);
     put64(&mut d, p + 32, 0x4000);
-    put64(&mut d, p + 48, 0x1000);
+    put64(&mut d, p + 48, 0x4000);
     put32(&mut d, p + 56, 7);
     put32(&mut d, p + 60, 5);
     put32(&mut d, p + 64, 1);
@@ -35,11 +35,22 @@ fn macho_fixture(filetype: u32) -> Vec<u8> {
     put64(&mut d, s + 32, 0x1_0000_0400);
     put64(&mut d, s + 40, 0x100);
     put32(&mut d, s + 48, 0x400);
-    let c = p + 152;
+    let linkedit = p + 152;
+    put32(&mut d, linkedit, 0x19);
+    put32(&mut d, linkedit + 4, 72);
+    d[linkedit + 8..linkedit + 18].copy_from_slice(b"__LINKEDIT");
+    put64(&mut d, linkedit + 24, 0x1_0000_4000);
+    put64(&mut d, linkedit + 32, 0x4000);
+    put64(&mut d, linkedit + 40, 0x4000);
+    put64(&mut d, linkedit + 48, 0x1000);
+    put32(&mut d, linkedit + 56, 1);
+    put32(&mut d, linkedit + 60, 1);
+    let c = linkedit + 72;
     put32(&mut d, c, 0x1d);
     put32(&mut d, c + 4, 16);
-    put32(&mut d, c + 8, 0x800);
-    put32(&mut d, c + 12, 16);
+    put32(&mut d, c + 8, 0x4800);
+    put32(&mut d, c + 12, 0x800);
+    d[0x4800..0x5000].fill(0xaa);
     put32(&mut d, 0x400, 0xd503201f);
     d
 }
@@ -70,7 +81,10 @@ fn patches_complete_ipa_and_stages_dylib() {
     zip.finish().unwrap();
     std::fs::write(&dylib, b"signed-demo-dylib").unwrap();
     std::fs::write(&manifest,"project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: { executable_member: Payload/Demo.app/Demo, authorized_only: true, prefer_unity_framework: true }\nconfig:\n  flags: [{ name: enabled, index: 0, default: true }]\n  strings: []\n  callbacks: []\nfunctions: []\ngenerated_hooks: []\npatches:\n  - name: auto_bytes\n    enabled: true\n    description: synthetic owned fixture\n    locator: { type: va, value: 0x100000400 }\n    patch: { type: branch_to_cave, action: { type: ret_if_flag, flag: enabled } }\n    expect: auto\n").unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_iaot"))
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_iaot"))
+        .canonicalize()
+        .unwrap();
+    let result = Command::new(executable)
         .args([
             "patch-ipa",
             "--manifest",

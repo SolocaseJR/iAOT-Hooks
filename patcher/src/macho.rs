@@ -19,6 +19,20 @@ const MH_DYLIB: u32 = 6;
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_CODE_SIGNATURE: u32 = 0x1d;
 const LC_LOAD_DYLIB: u32 = 0xc;
+const LC_SYMTAB: u32 = 0x2;
+const LC_DYSYMTAB: u32 = 0xb;
+const LC_TWOLEVEL_HINTS: u32 = 0x16;
+const LC_SEGMENT_SPLIT_INFO: u32 = 0x1e;
+const LC_DYLD_INFO: u32 = 0x22;
+const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
+const LC_FUNCTION_STARTS: u32 = 0x26;
+const LC_DATA_IN_CODE: u32 = 0x29;
+const LC_DYLIB_CODE_SIGN_DRS: u32 = 0x2b;
+const LC_LINKER_OPTIMIZATION_HINT: u32 = 0x2e;
+const LC_NOTE: u32 = 0x31;
+const LC_DYLD_EXPORTS_TRIE: u32 = 0x8000_0033;
+const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
+const LC_ATOM_INFO: u32 = 0x36;
 const HEADER_SIZE: usize = 32;
 const SEGMENT_SIZE: usize = 72;
 const CONFIG_SIZE: usize = 10312;
@@ -246,6 +260,81 @@ fn load_command_name(command: &[u8]) -> Option<&str> {
     let end = tail.iter().position(|&x| x == 0)?;
     std::str::from_utf8(&tail[..end]).ok()
 }
+
+fn shift_u32_file_offset(
+    command: &mut [u8],
+    field: usize,
+    threshold: u64,
+    delta: u64,
+) -> anyhow::Result<()> {
+    let value = u32at(command, field)? as u64;
+    if value != 0 && value >= threshold {
+        let shifted = value
+            .checked_add(delta)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("shifted Mach-O file offset exceeds 32 bits"))?;
+        put32(command, field, shifted);
+    }
+    Ok(())
+}
+
+fn shift_u64_file_offset(
+    command: &mut [u8],
+    field: usize,
+    threshold: u64,
+    delta: u64,
+) -> anyhow::Result<()> {
+    let value = u64at(command, field)?;
+    if value != 0 && value >= threshold {
+        let shifted = value
+            .checked_add(delta)
+            .ok_or_else(|| anyhow::anyhow!("shifted Mach-O file offset overflow"))?;
+        put64(command, field, shifted);
+    }
+    Ok(())
+}
+
+fn shift_linkedit_command_offsets(
+    cmd: u32,
+    command: &mut [u8],
+    threshold: u64,
+    delta: u64,
+) -> anyhow::Result<()> {
+    match cmd {
+        LC_SYMTAB => {
+            shift_u32_file_offset(command, 8, threshold, delta)?;
+            shift_u32_file_offset(command, 16, threshold, delta)?;
+        }
+        LC_DYSYMTAB => {
+            // tocoff, modtaboff, extrefsymoff, indirectsymoff, extreloff,
+            // and locreloff. Each is followed by its element count.
+            for field in [32, 40, 48, 56, 64, 72] {
+                shift_u32_file_offset(command, field, threshold, delta)?;
+            }
+        }
+        LC_DYLD_INFO | LC_DYLD_INFO_ONLY => {
+            // rebase, bind, weak-bind, lazy-bind, and export offset/size pairs.
+            for field in [8, 16, 24, 32, 40] {
+                shift_u32_file_offset(command, field, threshold, delta)?;
+            }
+        }
+        LC_CODE_SIGNATURE
+        | LC_SEGMENT_SPLIT_INFO
+        | LC_FUNCTION_STARTS
+        | LC_DATA_IN_CODE
+        | LC_DYLIB_CODE_SIGN_DRS
+        | LC_LINKER_OPTIMIZATION_HINT
+        | LC_DYLD_EXPORTS_TRIE
+        | LC_DYLD_CHAINED_FIXUPS
+        | LC_ATOM_INFO
+        | LC_TWOLEVEL_HINTS => {
+            shift_u32_file_offset(command, 8, threshold, delta)?;
+        }
+        LC_NOTE => shift_u64_file_offset(command, 24, threshold, delta)?,
+        _ => {}
+    }
+    Ok(())
+}
 fn vm_to_file(parsed: &Parsed, address: u64) -> anyhow::Result<usize> {
     for s in &parsed.segments {
         if address >= s.vmaddr && address < s.vmaddr + s.filesize {
@@ -263,11 +352,18 @@ fn file_to_vm(parsed: &Parsed, offset: usize) -> anyhow::Result<u64> {
     anyhow::bail!("file offset 0x{offset:x} is not mapped")
 }
 fn image_base(parsed: &Parsed) -> anyhow::Result<u64> {
+    if let Some(text) = parsed
+        .segments
+        .iter()
+        .find(|segment| segment.name == "__TEXT" && segment.filesize > 0)
+    {
+        return Ok(text.vmaddr);
+    }
     parsed
         .segments
         .iter()
-        .filter(|s| s.filesize > 0)
-        .map(|s| s.vmaddr)
+        .filter(|segment| segment.filesize > 0)
+        .map(|segment| segment.vmaddr)
         .min()
         .ok_or_else(|| anyhow::anyhow!("Mach-O has no file-backed segments"))
 }
@@ -484,12 +580,25 @@ fn locate(
             expected_matches,
             segment,
             section,
+            fallback_rva,
         } => {
-            let hits = pattern_hits(data, parsed, pattern, segment.as_deref(), section.as_deref())?;
-            if expected_matches.is_some_and(|count| hits.len() != count) {
-                anyhow::bail!("{label}: expected {expected_matches:?} pattern matches, found {}", hits.len())
+            let pattern_result = (|| -> anyhow::Result<usize> {
+                let hits =
+                    pattern_hits(data, parsed, pattern, segment.as_deref(), section.as_deref())?;
+                if expected_matches.is_some_and(|count| hits.len() != count) {
+                    anyhow::bail!(
+                        "{label}: expected {expected_matches:?} pattern matches, found {}",
+                        hits.len()
+                    )
+                }
+                choose(hits, *match_index, label)
+            })();
+
+            match (pattern_result, fallback_rva) {
+                (Ok(off), _) => off,
+                (Err(_), Some(rva)) => vm_to_file(parsed, image_base(parsed)? + *rva)?,
+                (Err(error), None) => return Err(error),
             }
-            choose(hits, *match_index, label)?
         }
         Locator::Symbol { symbol } | Locator::Export { symbol } => vm_to_file(parsed, symbol_address(data, symbol)?)?,
         Locator::Va { value } | Locator::Vmaddr { value } => vm_to_file(parsed, *value)?,
@@ -583,6 +692,7 @@ pub struct PatchReport {
     pub patches: usize,
     pub config_vmaddr: u64,
     pub cave_vmaddr: u64,
+    pub near_cave_vmaddr: Option<u64>,
     pub removed_code_signatures: usize,
     pub added_dylib_load_command: bool,
     pub resolutions: Vec<PatchResolution>,
@@ -620,9 +730,25 @@ pub fn patch_with_options(
     let original = std::fs::read(input)?;
     let parsed = parse(&original)?;
     let page = m.runtime.page_size;
+    let linkedit = parsed
+        .segments
+        .iter()
+        .find(|segment| segment.name == "__LINKEDIT")
+        .ok_or_else(|| anyhow::anyhow!("Mach-O has no __LINKEDIT segment"))?;
+    let linkedit_end = linkedit
+        .fileoff
+        .checked_add(linkedit.filesize)
+        .ok_or_else(|| anyhow::anyhow!("__LINKEDIT file range overflow"))?;
+    if linkedit_end != original.len() as u64 {
+        anyhow::bail!(
+            "__LINKEDIT must occupy the original file tail (ends at 0x{linkedit_end:x}, file is 0x{:x})",
+            original.len()
+        )
+    }
     let max_vm = parsed
         .segments
         .iter()
+        .filter(|segment| segment.name != "__LINKEDIT")
         .map(|s| s.vmaddr + s.vmsize)
         .max()
         .ok_or_else(|| anyhow::anyhow!("no segments"))?;
@@ -681,20 +807,91 @@ pub fn patch_with_options(
         };
         targets.push((p, off, vm, bytes, displaced));
     }
+
+    let mut direct_rewrites = Vec::new();
+    let mut cave_targets = Vec::new();
+    for target @ (patch, off, vm, bytes, _) in targets {
+        if patch.patch.kind == "branch_to_instruction_target" {
+            let built = (|| -> anyhow::Result<u64> {
+                let instruction_offset = patch.patch.instruction_offset.unwrap_or(0);
+                let source_off = (off as i128)
+                    .checked_add(instruction_offset as i128)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| anyhow::anyhow!("branch source offset overflow"))?;
+                if !source_off.is_multiple_of(4) {
+                    anyhow::bail!("branch source instruction is unaligned")
+                }
+                let source_vm = file_to_vm(&parsed, source_off)?;
+                let source_instruction = u32at(&original, source_off)?;
+                let target_vm = arm64::encoded_branch_target(source_instruction, source_vm)?;
+                vm_to_file(&parsed, target_vm)?;
+                arm64::b(vm, target_vm)?;
+                Ok(target_vm)
+            })();
+            let target_vm = match built {
+                Ok(value) => value,
+                Err(error) if patch.failure_behavior == FailureBehavior::DisableHook => {
+                    failures.push(PatchFailure {
+                        name: patch.name.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "patch {} direct branch generation failed",
+                        patch.name
+                    )))
+                }
+            };
+            resolutions.push(PatchResolution {
+                name: patch.name.clone(),
+                vmaddr: vm,
+                bytes,
+                automatic: patch.expect.as_deref().is_none_or(|value| value == "auto"),
+                original_vmaddr: None,
+            });
+            direct_rewrites.push((off, vm, target_vm));
+        } else {
+            cave_targets.push(target);
+        }
+    }
+
+    // Most images can reach the appended cave with a normal ARM64 B. Very large
+    // main executables cannot. A file-backed executable segment below __TEXT is
+    // rejected by stock dyld in this layout, so those sites use a prebuilt
+    // ADRP/ADD/BR veneer at the original site instead of a near segment.
     let mut cave = Vec::new();
     let mut redirects = Vec::new();
-    for (p, off, vm, displaced_bytes, displaced) in targets {
+    let mut occupied_targets: HashSet<usize> =
+        direct_rewrites.iter().map(|(off, _, _)| *off).collect();
+    for (p, off, vm, displaced_bytes, _displaced) in cave_targets {
         while cave.len() % 4 != 0 {
             cave.push(0)
         }
-        let start = cave_vm
+        let far_start = cave_vm
             .checked_add(cave.len() as u64)
             .ok_or_else(|| anyhow::anyhow!("code-cave VM range overflow"))?;
+        let patch_width = if arm64::b(vm, far_start).is_err() {
+            3
+        } else {
+            1
+        };
+        for index in 0..patch_width {
+            if !occupied_targets.insert(off + index * 4) {
+                anyhow::bail!("patch {} overlaps another patch's branch veneer", p.name)
+            }
+        }
+        let displaced = (0..patch_width)
+            .map(|index| u32at(&original, off + index * 4))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let start = far_start;
         let built = (|| -> anyhow::Result<(Vec<u8>, u64, Option<u64>)> {
             let mut local = Vec::new();
             let original_vm = if p.original_slot.is_some() {
                 let address = start;
-                local.extend_from_slice(&caves::build_original_trampoline(address, vm, displaced)?);
+                local
+                    .extend_from_slice(&caves::build_original_trampoline(address, vm, &displaced)?);
                 while local.len() % 4 != 0 {
                     local.push(0)
                 }
@@ -703,36 +900,44 @@ pub fn patch_with_options(
                 None
             };
             let address = start + local.len() as u64;
-            let (flag, callback, replacement) = match &p.patch.action {
+            let action = p.patch.action.as_ref().unwrap();
+            let (flag, callback, replacement) = match action {
                 PatchAction::RetIfFlag { flag } | PatchAction::ZeroRegisterIfFlag { flag, .. } => {
                     (Some(flags[flag.as_str()]), None, None)
                 }
                 PatchAction::CallbackIfFlag { flag, callback }
                 | PatchAction::CallbackReturnZeroIfFlag { flag, callback } => (
                     Some(flags[flag.as_str()]),
-                    Some(callbacks[callback.as_str()]),
+                    Some(callbacks[callback.as_deref().unwrap()]),
                     None,
                 ),
                 PatchAction::CallbackAfter { callback }
                 | PatchAction::BranchToCallback { callback } => {
-                    (None, Some(callbacks[callback.as_str()]), None)
+                    (None, Some(callbacks[callback.as_deref().unwrap()]), None)
                 }
                 PatchAction::BranchToReplacement { symbol } => {
                     (None, None, Some(symbol_address(&original, symbol)?))
                 }
             };
             let bridge = caves::build(&CaveRequest {
-                action: &p.patch.action,
+                action,
                 cave_address: address,
-                return_address: vm + 4,
+                // A direct B replaces one instruction.  An out-of-range
+                // redirect uses ADRP/ADD/BR and replaces three, so the
+                // trampoline must resume after the complete veneer.
+                return_address: vm + (patch_width as u64) * 4,
                 original_address: vm,
-                displaced,
+                displaced: &displaced,
                 config_address: config_vm,
                 flag_index: flag,
                 callback_index: callback,
                 replacement_address: replacement,
             })?;
-            arm64::b(vm, address)?;
+            if patch_width == 1 {
+                arm64::b(vm, address)?;
+            } else {
+                arm64::long_branch(vm, address)?;
+            }
             local.extend_from_slice(&bridge);
             Ok((local, address, original_vm))
         })();
@@ -764,51 +969,116 @@ pub fn patch_with_options(
             original_vmaddr: original_vm,
         });
         cave.extend_from_slice(&bytes);
-        redirects.push((off, vm, bridge_address));
+        redirects.push((off, vm, bridge_address, patch_width));
     }
     if cave.is_empty() {
         cave.extend_from_slice(&arm64::ret().to_le_bytes())
     }
-    let config_file = align(original.len() as u64, page)?;
+
+    // Fully linked Mach-O images require __LINKEDIT to remain the final
+    // file-backed segment. Insert the IAOT segments immediately before it,
+    // move the complete linkedit payload to the new tail, and shift every load
+    // command that points into that payload. This also leaves the code
+    // signature at EOF where codesign/ldid expect to replace it.
+    let config_vm_size = align(config.len() as u64, page)?;
+    let cave_vm_size = align(cave.len() as u64, page)?;
+    let config_file = align(linkedit.fileoff, page)?;
+    if config_file != linkedit.fileoff {
+        anyhow::bail!("__LINKEDIT file offset is not page aligned")
+    }
     let cave_file = align(
         config_file
-            .checked_add(config.len() as u64)
+            .checked_add(config_vm_size)
             .ok_or_else(|| anyhow::anyhow!("config file range overflow"))?,
         page,
     )?;
+    let moved_linkedit_file = align(
+        cave_file
+            .checked_add(cave_vm_size)
+            .ok_or_else(|| anyhow::anyhow!("cave file range overflow"))?,
+        page,
+    )?;
+    let moved_linkedit_vm = align(
+        cave_vm
+            .checked_add(cave_vm_size)
+            .ok_or_else(|| anyhow::anyhow!("cave VM range overflow"))?,
+        page,
+    )?;
+    let linkedit_file_delta = moved_linkedit_file
+        .checked_sub(linkedit.fileoff)
+        .ok_or_else(|| anyhow::anyhow!("__LINKEDIT file relocation underflow"))?;
+
     let mut commands = Vec::new();
     let mut kept = 0u32;
+    let signature_commands: Vec<Vec<u8>> = parsed
+        .commands
+        .iter()
+        .filter(|(cmd, _)| *cmd == LC_CODE_SIGNATURE)
+        .map(|(_, bytes)| bytes.clone())
+        .collect();
+    if signature_commands.len() > 1 {
+        anyhow::bail!(
+            "expected exactly one LC_CODE_SIGNATURE before patching, found {}",
+            signature_commands.len()
+        )
+    }
     let dylib_path = format!("@executable_path/Frameworks/{}", m.runtime.dylib_name);
     let already_loads_dylib = parsed.commands.iter().any(|(cmd, bytes)| {
         *cmd == LC_LOAD_DYLIB && load_command_name(bytes) == Some(dylib_path.as_str())
     });
     for (cmd, bytes) in &parsed.commands {
-        if *cmd != LC_CODE_SIGNATURE {
-            commands.extend_from_slice(bytes);
-            kept += 1
+        // Keep the original signature load command.  The output is unsigned,
+        // but external signers such as TrollStore's ldid require this command
+        // in order to place a replacement CodeDirectory and signature blob.
+        // It is appended below so it remains the final load command.
+        if *cmd == LC_CODE_SIGNATURE {
+            continue;
         }
+        if *cmd == LC_SEGMENT_64 && name16(&bytes[8..24]) == "__LINKEDIT" {
+            commands.extend_from_slice(&segment_command(
+                &m.runtime.config_segment,
+                config_vm,
+                config_vm_size,
+                config_file,
+                config.len() as u64,
+                3,
+            ));
+            commands.extend_from_slice(&segment_command(
+                &m.runtime.cave_segment,
+                cave_vm,
+                cave_vm_size,
+                cave_file,
+                cave.len() as u64,
+                5,
+            ));
+            let mut moved_linkedit = bytes.clone();
+            put64(&mut moved_linkedit, 24, moved_linkedit_vm);
+            put64(&mut moved_linkedit, 40, moved_linkedit_file);
+            commands.extend_from_slice(&moved_linkedit);
+            kept += 3;
+            continue;
+        }
+        let mut command = bytes.clone();
+        shift_linkedit_command_offsets(*cmd, &mut command, linkedit.fileoff, linkedit_file_delta)?;
+        commands.extend_from_slice(&command);
+        kept += 1;
     }
     let added_dylib_load_command = options.load_dylib && !already_loads_dylib;
     if added_dylib_load_command {
         commands.extend_from_slice(&dylib_command(&m.runtime.dylib_name)?);
         kept += 1;
     }
-    commands.extend_from_slice(&segment_command(
-        &m.runtime.config_segment,
-        config_vm,
-        align(config.len() as u64, page)?,
-        config_file,
-        config.len() as u64,
-        3,
-    ));
-    commands.extend_from_slice(&segment_command(
-        &m.runtime.cave_segment,
-        cave_vm,
-        align(cave.len() as u64, page)?,
-        cave_file,
-        cave.len() as u64,
-        5,
-    ));
+    if let Some(signature_command) = signature_commands.first() {
+        let mut command = signature_command.clone();
+        shift_linkedit_command_offsets(
+            LC_CODE_SIGNATURE,
+            &mut command,
+            linkedit.fileoff,
+            linkedit_file_delta,
+        )?;
+        commands.extend_from_slice(&command);
+        kept += 1;
+    }
     if HEADER_SIZE + commands.len() > parsed.first_content {
         anyhow::bail!(
             "not enough load-command padding: need {} bytes, have {}",
@@ -816,29 +1086,42 @@ pub fn patch_with_options(
             parsed.first_content - HEADER_SIZE
         )
     }
-    let mut out = original.clone();
-    for (off, len) in &parsed.signature_blobs {
-        out[*off..*off + *len].fill(0)
-    }
-    out[HEADER_SIZE..parsed.first_content].fill(0);
-    out[HEADER_SIZE..HEADER_SIZE + commands.len()].copy_from_slice(&commands);
-    put32(&mut out, 16, kept + 2);
-    put32(&mut out, 20, commands.len() as u32);
+    let mut out = original[..linkedit.fileoff as usize].to_vec();
     out.resize(config_file as usize, 0);
     out.extend_from_slice(&config);
     out.resize(cave_file as usize, 0);
     out.extend_from_slice(&cave);
-    for (off, vm, target) in &redirects {
-        out[*off..*off + 4].copy_from_slice(&arm64::b(*vm, *target)?.to_le_bytes())
+    out.resize(moved_linkedit_file as usize, 0);
+    out.extend_from_slice(&original[linkedit.fileoff as usize..]);
+    // Keep the existing blob parseable until the external signer replaces it.
+    // Zeroing it makes ldid/TrollStore reject the Mach-O before it gets a
+    // chance to generate the new signature.  The old signature is invalidated
+    // by the changed executable and is intentionally superseded during resign.
+    out[HEADER_SIZE..parsed.first_content].fill(0);
+    out[HEADER_SIZE..HEADER_SIZE + commands.len()].copy_from_slice(&commands);
+    put32(&mut out, 16, kept);
+    put32(&mut out, 20, commands.len() as u32);
+    for (off, vm, target, width) in &redirects {
+        if *width == 1 {
+            out[*off..*off + 4].copy_from_slice(&arm64::b(*vm, *target)?.to_le_bytes())
+        } else {
+            for (index, instruction) in arm64::long_branch(*vm, *target)?.iter().enumerate() {
+                out[*off + index * 4..*off + index * 4 + 4]
+                    .copy_from_slice(&instruction.to_le_bytes());
+            }
+        }
     }
-    verify_data(&out, m, Some(&redirects))?;
+    for (off, vm, target) in &direct_rewrites {
+        out[*off..*off + 4].copy_from_slice(&arm64::b(*vm, *target)?.to_le_bytes());
+    }
+    verify_data(&out, m, Some(&redirects), Some(&direct_rewrites))?;
     let output_parent = output.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(output_parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(output_parent)?;
     temporary.write_all(&out)?;
     temporary.as_file_mut().sync_all()?;
     let reopened = std::fs::read(temporary.path())?;
-    if let Err(error) = verify_data(&reopened, m, Some(&redirects)) {
+    if let Err(error) = verify_data(&reopened, m, Some(&redirects), Some(&direct_rewrites)) {
         return Err(error.context("reopened output verification failed"));
     }
     if options.load_dylib {
@@ -851,9 +1134,10 @@ pub fn patch_with_options(
     }
     temporary.persist(output).map_err(|error| error.error)?;
     Ok(PatchReport {
-        patches: redirects.len(),
+        patches: redirects.len() + direct_rewrites.len(),
         config_vmaddr: config_vm,
         cave_vmaddr: cave_vm,
+        near_cave_vmaddr: None,
         removed_code_signatures: parsed.signature_blobs.len(),
         added_dylib_load_command,
         resolutions,
@@ -864,7 +1148,8 @@ pub fn patch_with_options(
 fn verify_data(
     data: &[u8],
     m: &Manifest,
-    redirects: Option<&[(usize, u64, u64)]>,
+    redirects: Option<&[(usize, u64, u64, usize)]>,
+    direct_rewrites: Option<&[(usize, u64, u64)]>,
 ) -> anyhow::Result<()> {
     let p = parse(data)?;
     let cfg = p
@@ -899,22 +1184,129 @@ fn verify_data(
             }
         }
     }
-    if p.commands.iter().any(|x| x.0 == LC_CODE_SIGNATURE) {
-        anyhow::bail!("stale LC_CODE_SIGNATURE remains")
+    // Stock dyld requires both VM addresses and file offsets to be monotonic in
+    // segment load-command order. Keep this check here because structural
+    // overlap validation alone does not catch a launch-time DYLD abort.
+    let mut previous_vmaddr: Option<u64> = None;
+    let mut previous_fileoff: Option<u64> = None;
+    for s in &p.segments {
+        if let Some(prev) = previous_vmaddr {
+            if s.vmaddr < prev {
+                anyhow::bail!(
+                    "segment {} VM address out of order (0x{:x} follows 0x{:x}); dyld will refuse to launch this binary",
+                    s.name, s.vmaddr, prev
+                )
+            }
+        }
+        previous_vmaddr = Some(s.vmaddr);
+        if s.filesize == 0 && s.fileoff == 0 {
+            continue;
+        }
+        if let Some(prev) = previous_fileoff {
+            if s.fileoff < prev {
+                anyhow::bail!(
+                    "segment {} file offset out of order (0x{:x} follows 0x{:x} in load-command order); dyld will refuse to launch this binary",
+                    s.name,
+                    s.fileoff,
+                    prev
+                )
+            }
+        }
+        previous_fileoff = Some(s.fileoff);
     }
+    if p.segments
+        .iter()
+        .filter(|segment| segment.filesize > 0)
+        .next_back()
+        .is_none_or(|segment| segment.name != "__LINKEDIT")
+    {
+        anyhow::bail!("__LINKEDIT is not the final file-backed segment")
+    }
+    if p.commands
+        .iter()
+        .filter(|x| x.0 == LC_CODE_SIGNATURE)
+        .count()
+        > 1
+    {
+        anyhow::bail!("duplicate LC_CODE_SIGNATURE load commands")
+    }
+    verify_code_signature_layout(data, &p)?;
     if let Some(rs) = redirects {
-        for (off, pc, target) in rs {
+        for (off, pc, target, width) in rs {
             let i = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
-            if i != arm64::b(*pc, *target)?
-                || *target < cave.vmaddr
-                || *target >= cave.vmaddr + cave.vmsize
-            {
+            let in_far_cave = *target >= cave.vmaddr && *target < cave.vmaddr + cave.vmsize;
+            let valid_branch = if *width == 1 {
+                i == arm64::b(*pc, *target)?
+            } else {
+                let veneer = arm64::long_branch(*pc, *target)?;
+                let expected: Vec<u8> = veneer.iter().flat_map(|word| word.to_le_bytes()).collect();
+                data.get(*off..*off + expected.len()) == Some(expected.as_slice())
+            };
+            if !valid_branch || !in_far_cave {
                 anyhow::bail!("redirect verification failed")
+            }
+        }
+    }
+    if let Some(rewrites) = direct_rewrites {
+        for (off, pc, target) in rewrites {
+            let instruction = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
+            if instruction != arm64::b(*pc, *target)? {
+                anyhow::bail!("direct branch rewrite verification failed")
             }
         }
     }
     Ok(())
 }
+
+// The code signature is linkedit data: its file range must remain within the
+// __LINKEDIT segment.  A signer may replace its contents and update the load
+// command, but placing the replacement after an unrelated appended segment
+// produces a Mach-O that can pass simple range checks yet be rejected by dyld.
+fn verify_code_signature_layout(data: &[u8], parsed: &Parsed) -> anyhow::Result<()> {
+    // Minimal synthetic fixtures and some bare test dylibs legitimately have
+    // no linkedit segment.  For a production image that does have one, though,
+    // every signature range must be contained in it.
+    let Some(linkedit) = parsed
+        .segments
+        .iter()
+        .find(|segment| segment.name == "__LINKEDIT")
+    else {
+        return Ok(());
+    };
+    let signatures = parsed
+        .commands
+        .iter()
+        .filter(|(cmd, _)| *cmd == LC_CODE_SIGNATURE)
+        .collect::<Vec<_>>();
+    if signatures.len() != 1 {
+        anyhow::bail!(
+            "expected exactly one LC_CODE_SIGNATURE load command, found {}",
+            signatures.len()
+        )
+    }
+    let command = &signatures[0].1;
+    if command.len() < 16 {
+        anyhow::bail!("short LC_CODE_SIGNATURE load command")
+    }
+    let offset = u32at(command, 8)? as u64;
+    let size = u32at(command, 12)? as u64;
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| anyhow::anyhow!("code-signature range overflow"))?;
+    let linkedit_end = linkedit
+        .fileoff
+        .checked_add(linkedit.filesize)
+        .ok_or_else(|| anyhow::anyhow!("__LINKEDIT file range overflow"))?;
+    if size == 0 || end > data.len() as u64 || offset < linkedit.fileoff || end > linkedit_end {
+        anyhow::bail!(
+            "LC_CODE_SIGNATURE range 0x{offset:x}..0x{end:x} is not contained in __LINKEDIT file range 0x{:x}..0x{:x}",
+            linkedit.fileoff,
+            linkedit_end
+        )
+    }
+    Ok(())
+}
+
 pub fn verify(path: &Path) -> anyhow::Result<()> {
     let data = std::fs::read(path)?;
     let p = parse(&data)?;
@@ -945,6 +1337,7 @@ pub fn verify(path: &Path) -> anyhow::Result<()> {
             anyhow::bail!("invalid IAOT runtime config layout")
         }
     }
+    verify_code_signature_layout(&data, &p)?;
     Ok(())
 }
 pub fn verify_dylib(path: &Path) -> anyhow::Result<()> {
@@ -981,19 +1374,19 @@ mod tests {
     use tempfile::tempdir;
 
     fn fixture(section_offset: u32, instruction: u32) -> Vec<u8> {
-        let mut d = vec![0u8; 0x1000];
+        let mut d = vec![0u8; 0x5000];
         put32(&mut d, 0, MH_MAGIC_64);
         put32(&mut d, 4, CPU_TYPE_ARM64);
         put32(&mut d, 12, MH_EXECUTE);
-        put32(&mut d, 16, 2);
-        put32(&mut d, 20, 168);
+        put32(&mut d, 16, 3);
+        put32(&mut d, 20, 240);
         let p = HEADER_SIZE;
         put32(&mut d, p, LC_SEGMENT_64);
         put32(&mut d, p + 4, 152);
         d[p + 8..p + 14].copy_from_slice(b"__TEXT");
         put64(&mut d, p + 24, 0x1_0000_0000);
         put64(&mut d, p + 32, 0x4000);
-        put64(&mut d, p + 48, 0x1000);
+        put64(&mut d, p + 48, 0x4000);
         put32(&mut d, p + 56, 7);
         put32(&mut d, p + 60, 5);
         put32(&mut d, p + 64, 1);
@@ -1003,22 +1396,85 @@ mod tests {
         put64(&mut d, s + 32, 0x1_0000_0000 + section_offset as u64);
         put64(&mut d, s + 40, 0x100);
         put32(&mut d, s + 48, section_offset);
-        let c = p + 152;
+        let linkedit = p + 152;
+        put32(&mut d, linkedit, LC_SEGMENT_64);
+        put32(&mut d, linkedit + 4, SEGMENT_SIZE as u32);
+        d[linkedit + 8..linkedit + 18].copy_from_slice(b"__LINKEDIT");
+        put64(&mut d, linkedit + 24, 0x1_0000_4000);
+        put64(&mut d, linkedit + 32, 0x4000);
+        put64(&mut d, linkedit + 40, 0x4000);
+        put64(&mut d, linkedit + 48, 0x1000);
+        put32(&mut d, linkedit + 56, 1);
+        put32(&mut d, linkedit + 60, 1);
+        let c = linkedit + SEGMENT_SIZE;
         put32(&mut d, c, LC_CODE_SIGNATURE);
         put32(&mut d, c + 4, 16);
-        put32(&mut d, c + 8, 0x800);
-        put32(&mut d, c + 12, 16);
-        d[0x800..0x810].fill(0xaa);
+        put32(&mut d, c + 8, 0x4800);
+        put32(&mut d, c + 12, 0x800);
+        d[0x4800..0x5000].fill(0xaa);
         put32(&mut d, section_offset as usize, instruction);
         put32(&mut d, 0x400, instruction);
         d
     }
+    fn far_fixture(instruction: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 0x5000];
+        put32(&mut d, 0, MH_MAGIC_64);
+        put32(&mut d, 4, CPU_TYPE_ARM64);
+        put32(&mut d, 12, MH_EXECUTE);
+        put32(&mut d, 16, 4);
+        put32(&mut d, 20, 312);
+
+        let pagezero = HEADER_SIZE;
+        put32(&mut d, pagezero, LC_SEGMENT_64);
+        put32(&mut d, pagezero + 4, SEGMENT_SIZE as u32);
+        d[pagezero + 8..pagezero + 18].copy_from_slice(b"__PAGEZERO");
+        put64(&mut d, pagezero + 24, 0);
+        put64(&mut d, pagezero + 32, 0x1_0000_0000);
+
+        let text = pagezero + SEGMENT_SIZE;
+        put32(&mut d, text, LC_SEGMENT_64);
+        put32(&mut d, text + 4, 152);
+        d[text + 8..text + 14].copy_from_slice(b"__TEXT");
+        put64(&mut d, text + 24, 0x1_0000_0000);
+        put64(&mut d, text + 32, 0x1000_0000);
+        put64(&mut d, text + 48, 0x4000);
+        put32(&mut d, text + 56, 7);
+        put32(&mut d, text + 60, 5);
+        put32(&mut d, text + 64, 1);
+        let section = text + SEGMENT_SIZE;
+        d[section..section + 6].copy_from_slice(b"__text");
+        d[section + 16..section + 22].copy_from_slice(b"__TEXT");
+        put64(&mut d, section + 32, 0x1_0000_0400);
+        put64(&mut d, section + 40, 0x100);
+        put32(&mut d, section + 48, 0x400);
+
+        let linkedit = text + 152;
+        put32(&mut d, linkedit, LC_SEGMENT_64);
+        put32(&mut d, linkedit + 4, SEGMENT_SIZE as u32);
+        d[linkedit + 8..linkedit + 18].copy_from_slice(b"__LINKEDIT");
+        put64(&mut d, linkedit + 24, 0x1_1000_0000);
+        put64(&mut d, linkedit + 32, 0x4000);
+        put64(&mut d, linkedit + 40, 0x4000);
+        put64(&mut d, linkedit + 48, 0x1000);
+        put32(&mut d, linkedit + 56, 1);
+        put32(&mut d, linkedit + 60, 1);
+
+        let signature = linkedit + SEGMENT_SIZE;
+        put32(&mut d, signature, LC_CODE_SIGNATURE);
+        put32(&mut d, signature + 4, 16);
+        put32(&mut d, signature + 8, 0x4800);
+        put32(&mut d, signature + 12, 0x800);
+        d[0x4800..0x5000].fill(0xaa);
+        put32(&mut d, 0x400, instruction);
+        d
+    }
+
     fn manifest() -> Manifest {
         serde_yaml::from_str("project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: { authorized_only: true }\nconfig:\n  flags: [{ name: enabled, index: 0, default: true }]\n  strings: [{ name: text, index: 0, default: hello }]\n  callbacks: []\nfunctions: []\ngenerated_hooks: []\npatches:\n  - name: test\n    enabled: true\n    description: owned synthetic fixture\n    locator: { type: va, value: 0x100000400 }\n    patch: { type: branch_to_cave, action: { type: ret_if_flag, flag: enabled } }\n    expect: '1F 20 03 D5'\n").unwrap()
     }
 
     #[test]
-    fn writes_segments_redirect_and_removes_signature() {
+    fn writes_segments_redirect_and_preserves_signature_command_for_resigning() {
         let dir = tempdir().unwrap();
         let input = dir.path().join("in");
         let output = dir.path().join("out");
@@ -1032,7 +1488,13 @@ mod tests {
         let p = parse(&out).unwrap();
         assert!(p.segments.iter().any(|s| s.name == "__IAOTCFG"));
         assert!(p.segments.iter().any(|s| s.name == "__IAOTCAVE"));
-        assert!(!p.commands.iter().any(|x| x.0 == LC_CODE_SIGNATURE));
+        assert_eq!(
+            p.commands
+                .iter()
+                .filter(|x| x.0 == LC_CODE_SIGNATURE)
+                .count(),
+            1
+        );
         let cfg = p.segments.iter().find(|s| s.name == "__IAOTCFG").unwrap();
         assert_eq!(
             &out[cfg.fileoff as usize..cfg.fileoff as usize + 8],
@@ -1040,6 +1502,48 @@ mod tests {
         );
         assert_ne!(u32at(&out, 0x400).unwrap(), 0xd503201f);
     }
+
+    #[test]
+    fn writes_and_verifies_exact_direct_branch_rewrite() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("in");
+        let output = dir.path().join("out");
+        let mut input_bytes = fixture(0x400, 0xd503201f);
+        put32(&mut input_bytes, 0x404, 0x34000020);
+        std::fs::write(&input, input_bytes).unwrap();
+        let mut m = manifest();
+        m.patches[0].patch.kind = "branch_to_instruction_target".into();
+        m.patches[0].patch.action = None;
+        m.patches[0].patch.instruction_offset = Some(4);
+        crate::manifest::validate(&m, false).unwrap();
+
+        let report = patch(&m, &input, &output).unwrap();
+        assert_eq!(report.patches, 1);
+        assert_eq!(report.resolutions[0].bytes, [0x1f, 0x20, 0x03, 0xd5]);
+        let out = std::fs::read(&output).unwrap();
+        assert_eq!(u32at(&out, 0x400).unwrap(), 0x14000002);
+    }
+
+    #[test]
+    fn uses_signed_long_branch_when_direct_branch_is_out_of_range() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("in");
+        let output = dir.path().join("out");
+        std::fs::write(&input, far_fixture(0xd503201f)).unwrap();
+        let report = patch(&manifest(), &input, &output).unwrap();
+        assert_eq!(report.patches, 1);
+        assert_eq!(report.near_cave_vmaddr, None);
+
+        let out = std::fs::read(&output).unwrap();
+        let parsed = parse(&out).unwrap();
+        assert!(!parsed
+            .segments
+            .iter()
+            .any(|segment| segment.name == "__IAOTNRC"));
+        assert_eq!(u32at(&out, 0x400).unwrap() & 0x9f00_001f, 0x9000_0010);
+        assert_eq!(image_base(&parsed).unwrap(), 0x1_0000_0000);
+    }
+
     #[test]
     fn refuses_missing_load_command_padding() {
         let dir = tempdir().unwrap();
@@ -1102,12 +1606,120 @@ mod tests {
         std::fs::write(&input, fixture(0x400, 0xd503201f)).unwrap();
         let mut m = manifest();
         m.patches[0].failure_behavior = FailureBehavior::DisableHook;
-        m.patches[0].patch.action = PatchAction::BranchToReplacement {
+        m.patches[0].patch.action = Some(PatchAction::BranchToReplacement {
             symbol: "_MissingOwnedSymbol".into(),
-        };
+        });
         let report = patch(&m, &input, &output).unwrap();
         assert_eq!(report.patches, 0);
         assert!(report.resolutions.is_empty());
         assert_eq!(report.failures.len(), 1);
+    }
+
+    fn linkedit_fixture(instruction: u32) -> Vec<u8> {
+        // __TEXT [0,0x4000) vm 0x1_0000_0000 with __text at 0x400; __LINKEDIT
+        // [0x4000,0x4400) vm 0x1_0000_4000 holding a symbol table and a trailing
+        // code-signature blob. LC_SYMTAB and LC_CODE_SIGNATURE point into
+        // __LINKEDIT so the relocation offset fix-ups are exercised.
+        let mut d = vec![0u8; 0x4400];
+        put32(&mut d, 0, MH_MAGIC_64);
+        put32(&mut d, 4, CPU_TYPE_ARM64);
+        put32(&mut d, 12, MH_EXECUTE);
+        put32(&mut d, 16, 4);
+        put32(&mut d, 20, (152 + SEGMENT_SIZE + 24 + 16) as u32);
+
+        let text = HEADER_SIZE;
+        put32(&mut d, text, LC_SEGMENT_64);
+        put32(&mut d, text + 4, 152);
+        d[text + 8..text + 14].copy_from_slice(b"__TEXT");
+        put64(&mut d, text + 24, 0x1_0000_0000);
+        put64(&mut d, text + 32, 0x4000);
+        put64(&mut d, text + 40, 0);
+        put64(&mut d, text + 48, 0x4000);
+        put32(&mut d, text + 56, 7);
+        put32(&mut d, text + 60, 5);
+        put32(&mut d, text + 64, 1);
+        let section = text + SEGMENT_SIZE;
+        d[section..section + 6].copy_from_slice(b"__text");
+        d[section + 16..section + 22].copy_from_slice(b"__TEXT");
+        put64(&mut d, section + 32, 0x1_0000_0400);
+        put64(&mut d, section + 40, 0x100);
+        put32(&mut d, section + 48, 0x400);
+
+        let linkedit = text + 152;
+        put32(&mut d, linkedit, LC_SEGMENT_64);
+        put32(&mut d, linkedit + 4, SEGMENT_SIZE as u32);
+        d[linkedit + 8..linkedit + 18].copy_from_slice(b"__LINKEDIT");
+        put64(&mut d, linkedit + 24, 0x1_0000_4000);
+        put64(&mut d, linkedit + 32, 0x4000);
+        put64(&mut d, linkedit + 40, 0x4000);
+        put64(&mut d, linkedit + 48, 0x400);
+        put32(&mut d, linkedit + 56, 1);
+        put32(&mut d, linkedit + 60, 1);
+
+        let symtab = linkedit + SEGMENT_SIZE;
+        put32(&mut d, symtab, LC_SYMTAB);
+        put32(&mut d, symtab + 4, 24);
+        put32(&mut d, symtab + 8, 0x4000); // symoff -> start of __LINKEDIT
+        put32(&mut d, symtab + 12, 1);
+        put32(&mut d, symtab + 16, 0x4100); // stroff -> inside __LINKEDIT
+        put32(&mut d, symtab + 20, 0x40);
+
+        let signature = symtab + 24;
+        put32(&mut d, signature, LC_CODE_SIGNATURE);
+        put32(&mut d, signature + 4, 16);
+        put32(&mut d, signature + 8, 0x4200); // dataoff -> tail of __LINKEDIT
+        put32(&mut d, signature + 12, 0x100);
+        d[0x4200..0x4300].fill(0xaa);
+
+        put32(&mut d, 0x400, instruction);
+        d
+    }
+
+    #[test]
+    fn moves_linkedit_behind_iaot_segments_and_shifts_offsets() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("in");
+        let output = dir.path().join("out");
+        std::fs::write(&input, linkedit_fixture(0xd503201f)).unwrap();
+        let report = patch(&manifest(), &input, &output).unwrap();
+        assert_eq!(report.patches, 1);
+
+        let out = std::fs::read(&output).unwrap();
+        let p = parse(&out).unwrap();
+        let mut previous_vm = 0;
+        let mut previous_file = 0;
+        for s in &p.segments {
+            assert!(s.vmaddr >= previous_vm, "segment {} VM order", s.name);
+            if s.filesize > 0 || s.fileoff > 0 {
+                assert!(s.fileoff >= previous_file, "segment {} file order", s.name);
+                previous_file = s.fileoff;
+            }
+            previous_vm = s.vmaddr;
+        }
+        assert!(p.segments.iter().any(|s| s.name == "__IAOTCFG"));
+        assert!(p.segments.iter().any(|s| s.name == "__IAOTCAVE"));
+        assert_eq!(p.segments.last().unwrap().name, "__LINKEDIT");
+        let moved_linkedit = p.segments.last().unwrap();
+        assert_eq!(moved_linkedit.vmaddr, 0x1_0000_c000);
+        assert_eq!(moved_linkedit.fileoff, 0xc000);
+        assert_eq!(out.len(), 0xc400);
+
+        // All linkedit-relative offsets move by the same 0x8000 delta.
+        let symtab = p
+            .commands
+            .iter()
+            .find(|(cmd, _)| *cmd == LC_SYMTAB)
+            .map(|(_, bytes)| bytes.clone())
+            .unwrap();
+        assert_eq!(u32at(&symtab, 8).unwrap() as u64, 0xc000);
+        assert_eq!(u32at(&symtab, 16).unwrap() as u64, 0xc100);
+        let signature = p
+            .commands
+            .iter()
+            .find(|(cmd, _)| *cmd == LC_CODE_SIGNATURE)
+            .map(|(_, bytes)| bytes.clone())
+            .unwrap();
+        assert_eq!(u32at(&signature, 8).unwrap() as u64, 0xc200);
+        assert_eq!(&out[0xc200..0xc300], &[0xaa; 0x100]);
     }
 }

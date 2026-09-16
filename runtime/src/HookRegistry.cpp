@@ -54,6 +54,46 @@ bool InstallAllHooks(const HookContext &ctx) {
   }
   return ok;
 }
+bool AreRegisteredHooksReady() {
+  std::lock_guard<std::mutex> lock(g_registryMutex);
+  for (std::size_t i = 0; i < g_count; ++i)
+    if (g_status[i] != HookStatus::Ready && g_status[i] != HookStatus::Disabled)
+      return false;
+  return true;
+}
+bool RetryFailedHooks(const HookContext &ctx) {
+  bool ok = true;
+  std::size_t count = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_registryMutex);
+    count = g_count;
+  }
+  for (std::size_t i = 0; i < count; ++i) {
+    HookEntry entry{};
+    {
+      std::lock_guard<std::mutex> lock(g_registryMutex);
+      // Only Failed entries are retried. Skipping Ready ones is what makes this
+      // safe to call repeatedly: a hook that captured the original IMP would
+      // otherwise capture its own replacement and recurse.
+      if (g_status[i] != HookStatus::Failed)
+        continue;
+      g_status[i] = HookStatus::Installing;
+      entry = g_hooks[i];
+    }
+    const bool installed = entry.install(ctx);
+    {
+      std::lock_guard<std::mutex> lock(g_registryMutex);
+      g_status[i] = installed ? HookStatus::Ready : HookStatus::Failed;
+    }
+    if (installed) {
+      Logf("IAOT hook installed on retry: %s", entry.name);
+    } else {
+      Logf("IAOT hook still failing after retry: %s", entry.name);
+      ok = false;
+    }
+  }
+  return ok;
+}
 std::size_t GetRegisteredHookCount() {
   std::lock_guard<std::mutex> lock(g_registryMutex);
   return g_count;

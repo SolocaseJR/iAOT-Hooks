@@ -4,13 +4,9 @@
 #include "IAOTGeneratedFunctions.hpp"
 #include "IAOTGeneratedOriginals.hpp"
 #include "IAOTGeneratedProject.hpp"
-extern "C" int IAOT_ExampleHook(void*, int);
 extern "C" bool IAOT_InstallUserHooks(const iaot::HookContext& ctx);
 namespace iaot { void RegisterGeneratedHooks() {
     SetLogLevel(LogLevel::Info);
-    RegisterHook({ OBF("IL2CPPRuntimeResolver"), +[](const HookContext&) -> bool { il2cpp::Options options; options.moduleName = *IAOT_IL2CPP_MODULE ? IAOT_IL2CPP_MODULE : nullptr; return il2cpp::InitializeAsync(options); } });
-    RegisterHook({ OBF("GeneratedCallbacks"), +[](const HookContext&) -> bool {
-        IAOTSetCallback(IAOTCallback::example_hook_callback, reinterpret_cast<std::uintptr_t>(&IAOT_ExampleHook));
-        return true; } });
+    RegisterHook({ OBF("IL2CPPRuntimeResolver"), +[](const HookContext&) -> bool { il2cpp::Options options; options.moduleName = *IAOT_IL2CPP_MODULE ? IAOT_IL2CPP_MODULE : nullptr; options.stringFactoryRva = IAOT_IL2CPP_STRING_FACTORY_RVA; options.offlineMetadata = &IAOTOfflineMetadata; return il2cpp::InitializeAsync(options); } });
     RegisterHook({ OBF("UserHooks"), IAOT_InstallUserHooks });
 } }
