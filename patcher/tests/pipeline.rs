@@ -80,7 +80,7 @@ fn complete_pipeline_analyzes_injects_repackages_and_validates() {
     RgbImage::from_pixel(256, 256, Rgb([17, 34, 51]))
         .save(&icon)
         .unwrap();
-    std::fs::write(&manifest,"project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: { authorized_only: true, display_name: Branded Demo, icon_path: icon.png }\nanalysis: { runtime_il2cpp: false }\nconfig: { flags: [], strings: [], callbacks: [] }\nfunctions: []\ngenerated_hooks: []\npatches: []\n").unwrap();
+    std::fs::write(&manifest,"project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: { display_name: Branded Demo, icon_path: icon.png }\nanalysis: { runtime_il2cpp: false }\nconfig: { flags: [], strings: [], callbacks: [] }\nfunctions: []\ngenerated_hooks: []\npatches: []\n").unwrap();
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_iaot"))
         .canonicalize()
         .unwrap();

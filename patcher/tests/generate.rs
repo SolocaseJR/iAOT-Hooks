@@ -9,7 +9,7 @@ fn disabled_objective_c_hooks_keep_original_accessors_but_are_not_installed() {
         &manifest,
         "project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\n\
 runtime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\n\
-app: { authorized_only: true }\n\
+app: {}\n\
 analysis: { runtime_il2cpp: false }\n\
 config: { flags: [], strings: [], callbacks: [] }\n\
 functions:\n\

@@ -34,13 +34,9 @@ enum Cmd {
     },
     Validate {
         manifest: PathBuf,
-        #[arg(long)]
-        force_authorized: bool,
     },
     Generate {
         manifest: PathBuf,
-        #[arg(long)]
-        force_authorized: bool,
     },
     ResolveConfig {
         #[arg(long)]
@@ -86,8 +82,6 @@ enum Cmd {
         output: PathBuf,
         #[arg(long)]
         load_dylib: bool,
-        #[arg(long)]
-        force_authorized: bool,
     },
     PatchIpa {
         #[arg(long)]
@@ -100,8 +94,6 @@ enum Cmd {
         member: Option<String>,
         #[arg(long)]
         dylib: Option<PathBuf>,
-        #[arg(long)]
-        force_authorized: bool,
     },
     RepackIpa {
         #[arg(long = "in")]
@@ -120,9 +112,9 @@ enum Cmd {
         binary: PathBuf,
     },
 }
-fn validated(path: &Path, _force: bool) -> anyhow::Result<manifest::Manifest> {
+fn validated(path: &Path) -> anyhow::Result<manifest::Manifest> {
     let m = manifest::load(path)?;
-    manifest::validate(&m, false)?;
+    manifest::validate(&m)?;
     Ok(m)
 }
 fn print_patch_report(report: &macho::PatchReport) {
@@ -192,7 +184,7 @@ fn resolve_project_path(source_dir: &Path, value: Option<PathBuf>) -> Option<Pat
 }
 
 fn resolved_project_config(path: &Path) -> anyhow::Result<ResolvedProjectConfig> {
-    let configured = validated(path, false)?;
+    let configured = validated(path)?;
     let source_dir = if configured.source_dir.is_absolute() {
         configured.source_dir.clone()
     } else {
@@ -266,7 +258,7 @@ fn new_project(name: &str) -> anyhow::Result<()> {
         .replace("ExampleHooks", name);
     fs::write(d.join("Makefile"), makefile)?;
     let m = manifest::load(&manifest_path)?;
-    manifest::validate(&m, false)?;
+    manifest::validate(&m)?;
     generate::generate(&m, &manifest_path)?;
     println!("created {}", d.display());
     Ok(())
@@ -275,18 +267,12 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::New { name } => new_project(&name)?,
-        Cmd::Validate {
-            manifest,
-            force_authorized,
-        } => {
-            validated(&manifest, force_authorized)?;
+        Cmd::Validate { manifest } => {
+            validated(&manifest)?;
             println!("manifest is valid for authorized iOS instrumentation")
         }
-        Cmd::Generate {
-            manifest,
-            force_authorized,
-        } => {
-            let m = validated(&manifest, force_authorized)?;
+        Cmd::Generate { manifest } => {
+            let m = validated(&manifest)?;
             generate::generate(&m, &manifest)?;
             println!("generated files next to {}", manifest.display())
         }
@@ -355,9 +341,8 @@ fn main() -> anyhow::Result<()> {
             input,
             output,
             load_dylib,
-            force_authorized,
         } => {
-            let m = validated(&manifest, force_authorized)?;
+            let m = validated(&manifest)?;
             let report = if load_dylib {
                 macho::patch_with_options(
                     &m,
@@ -377,12 +362,11 @@ fn main() -> anyhow::Result<()> {
             output,
             member,
             dylib,
-            force_authorized,
         } => {
             if input == output {
                 anyhow::bail!("input and output IPA paths must differ")
             }
-            let m = validated(&manifest, force_authorized)?;
+            let m = validated(&manifest)?;
             let unity_member = if member.is_none() && m.app.prefer_unity_framework {
                 ipa::find_unity_framework_member(&input)?
             } else {

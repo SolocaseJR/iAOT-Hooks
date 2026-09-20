@@ -708,7 +708,7 @@ fn unique<T: std::hash::Hash + Eq + Copy>(
     }
     Ok(())
 }
-pub fn validate(m: &Manifest, _force: bool) -> Result<(), IaotError> {
+pub fn validate(m: &Manifest) -> Result<(), IaotError> {
     if m.project.name.is_empty()
         || m.project.bundle_id.is_empty()
         || m.runtime.dylib_name.is_empty()
@@ -1209,11 +1209,11 @@ fn valid_signature(sig: &str) -> bool {
 mod tests {
     use super::*;
     fn parse(extra: &str) -> Result<Manifest, serde_yaml::Error> {
-        serde_yaml::from_str(&format!("project: {{ name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }}\nruntime: {{ config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }}\napp: {{ executable_member: Payload/Demo.app/Demo, authorized_only: true }}\nconfig: {{ flags: [], strings: [], callbacks: [] }}\nfunctions: []\ngenerated_hooks: []\npatches: []\n{extra}"))
+        serde_yaml::from_str(&format!("project: {{ name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }}\nruntime: {{ config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }}\napp: {{ executable_member: Payload/Demo.app/Demo }}\nconfig: {{ flags: [], strings: [], callbacks: [] }}\nfunctions: []\ngenerated_hooks: []\npatches: []\n{extra}"))
     }
     #[test]
     fn valid_example() {
-        assert!(validate(&parse("").unwrap(), false).is_ok());
+        assert!(validate(&parse("").unwrap()).is_ok());
     }
     #[test]
     fn generated_hook_enabled_defaults_to_true_and_honors_false() {
@@ -1244,7 +1244,7 @@ mod tests {
                 default: true,
             },
         ];
-        assert!(validate(&m, false).is_err());
+        assert!(validate(&m).is_err());
     }
     #[test]
     fn duplicate_string() {
@@ -1261,7 +1261,7 @@ mod tests {
                 default: "y".into(),
             },
         ];
-        assert!(validate(&m, false).is_err());
+        assert!(validate(&m).is_err());
     }
     #[test]
     fn duplicate_callback() {
@@ -1282,7 +1282,7 @@ mod tests {
                 auto_register: false,
             },
         ];
-        assert!(validate(&m, false).is_err());
+        assert!(validate(&m).is_err());
     }
     #[test]
     fn conflicting_callback_symbol_signatures_are_rejected() {
@@ -1303,7 +1303,7 @@ mod tests {
                 auto_register: true,
             },
         ];
-        assert!(validate(&m, false).is_err());
+        assert!(validate(&m).is_err());
     }
     #[test]
     fn replacement_shorthand_allocates_and_wires_runtime_slots() {
@@ -1323,7 +1323,7 @@ mod tests {
         );
 
         expand_replacement_shorthand(&mut m).unwrap();
-        validate(&m, false).unwrap();
+        validate(&m).unwrap();
 
         assert_eq!(m.config.callbacks.len(), 1);
         let callback = &m.config.callbacks[0];
@@ -1360,29 +1360,29 @@ mod tests {
         }
 
         expand_replacement_shorthand(&mut m).unwrap();
-        validate(&m, false).unwrap();
+        validate(&m).unwrap();
         assert!(m.config.callbacks.is_empty());
         assert!(m.patches.iter().all(|patch| patch.original_slot.is_none()));
     }
 
     #[test]
     fn missing_hook_symbol() {
-        let yaml="project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: { authorized_only: true }\ngenerated_hooks: [{ name: bad }]";
+        let yaml="project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: {}\ngenerated_hooks: [{ name: bad }]";
         assert!(serde_yaml::from_str::<Manifest>(yaml).is_err());
     }
     #[test]
     fn invalid_segment() {
         let mut m = parse("").unwrap();
         m.runtime.config_segment = "too_long_segment_name".into();
-        assert!(validate(&m, false).is_err());
+        assert!(validate(&m).is_err());
     }
     #[test]
     fn invalid_page_size() {
         let mut m = parse("").unwrap();
         m.runtime.page_size = 1;
-        assert!(validate(&m, false).is_err());
+        assert!(validate(&m).is_err());
         m.runtime.page_size = 131_072;
-        assert!(validate(&m, false).is_err());
+        assert!(validate(&m).is_err());
     }
     #[test]
     fn validates_objective_c_hook_definition() {
@@ -1391,15 +1391,15 @@ mod tests {
             "{ name: ExampleTitle, kind: objc, class: ExampleController, selector: title, class_method: false, signature: 'id(id, SEL)', replacement: IAOT_ExampleTitle, preserve_original: true }",
         )
         .unwrap()];
-        assert!(validate(&m, false).is_ok());
+        assert!(validate(&m).is_ok());
         m.functions[0].replacement = None;
-        assert!(validate(&m, false).is_err());
+        assert!(validate(&m).is_err());
     }
     #[test]
     fn invalid_member() {
         let mut m = parse("").unwrap();
         m.app.executable_member = Some("../escape".into());
-        assert!(validate(&m, false).is_err());
+        assert!(validate(&m).is_err());
     }
 
     #[test]
@@ -1421,7 +1421,7 @@ mod tests {
         assert_eq!(loaded.build.mode, "release");
         assert!(!loaded.analysis.static_il2cpp);
         assert!(!loaded.analysis.runtime_il2cpp);
-        validate(&loaded, false).unwrap();
+        validate(&loaded).unwrap();
     }
 
     #[test]
@@ -1450,6 +1450,6 @@ mod tests {
             Some("UnityFramework")
         );
         assert_eq!(loaded.runtime.offline_classes.len(), 1);
-        validate(&loaded, false).unwrap();
+        validate(&loaded).unwrap();
     }
 }

@@ -1470,7 +1470,7 @@ mod tests {
     }
 
     fn manifest() -> Manifest {
-        serde_yaml::from_str("project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: { authorized_only: true }\nconfig:\n  flags: [{ name: enabled, index: 0, default: true }]\n  strings: [{ name: text, index: 0, default: hello }]\n  callbacks: []\nfunctions: []\ngenerated_hooks: []\npatches:\n  - name: test\n    enabled: true\n    description: owned synthetic fixture\n    locator: { type: va, value: 0x100000400 }\n    patch: { type: branch_to_cave, action: { type: ret_if_flag, flag: enabled } }\n    expect: '1F 20 03 D5'\n").unwrap()
+        serde_yaml::from_str("project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: {}\nconfig:\n  flags: [{ name: enabled, index: 0, default: true }]\n  strings: [{ name: text, index: 0, default: hello }]\n  callbacks: []\nfunctions: []\ngenerated_hooks: []\npatches:\n  - name: test\n    enabled: true\n    description: owned synthetic fixture\n    locator: { type: va, value: 0x100000400 }\n    patch: { type: branch_to_cave, action: { type: ret_if_flag, flag: enabled } }\n    expect: '1F 20 03 D5'\n").unwrap()
     }
 
     #[test]
@@ -1480,7 +1480,7 @@ mod tests {
         let output = dir.path().join("out");
         std::fs::write(&input, fixture(0x400, 0xd503201f)).unwrap();
         let m = manifest();
-        crate::manifest::validate(&m, false).unwrap();
+        crate::manifest::validate(&m).unwrap();
         let report = patch(&m, &input, &output).unwrap();
         assert_eq!(report.patches, 1);
         assert_eq!(report.removed_code_signatures, 1);
@@ -1515,7 +1515,7 @@ mod tests {
         m.patches[0].patch.kind = "branch_to_instruction_target".into();
         m.patches[0].patch.action = None;
         m.patches[0].patch.instruction_offset = Some(4);
-        crate::manifest::validate(&m, false).unwrap();
+        crate::manifest::validate(&m).unwrap();
 
         let report = patch(&m, &input, &output).unwrap();
         assert_eq!(report.patches, 1);

@@ -41,7 +41,6 @@ app:
   # Optional SpringBoard branding. The icon must be a square PNG (1024x1024 recommended).
   display_name: null
   icon_path: null
-  authorized_only: true
 
 # il2cpp_config.yaml is not opened at all when enabled is false.
 il2cpp:

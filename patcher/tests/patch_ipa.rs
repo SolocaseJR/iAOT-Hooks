@@ -80,7 +80,7 @@ fn patches_complete_ipa_and_stages_dylib() {
     zip.write_all(b"plist").unwrap();
     zip.finish().unwrap();
     std::fs::write(&dylib, b"signed-demo-dylib").unwrap();
-    std::fs::write(&manifest,"project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: { executable_member: Payload/Demo.app/Demo, authorized_only: true, prefer_unity_framework: true }\nconfig:\n  flags: [{ name: enabled, index: 0, default: true }]\n  strings: []\n  callbacks: []\nfunctions: []\ngenerated_hooks: []\npatches:\n  - name: auto_bytes\n    enabled: true\n    description: synthetic owned fixture\n    locator: { type: va, value: 0x100000400 }\n    patch: { type: branch_to_cave, action: { type: ret_if_flag, flag: enabled } }\n    expect: auto\n").unwrap();
+    std::fs::write(&manifest,"project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: { executable_member: Payload/Demo.app/Demo, prefer_unity_framework: true }\nconfig:\n  flags: [{ name: enabled, index: 0, default: true }]\n  strings: []\n  callbacks: []\nfunctions: []\ngenerated_hooks: []\npatches:\n  - name: auto_bytes\n    enabled: true\n    description: synthetic owned fixture\n    locator: { type: va, value: 0x100000400 }\n    patch: { type: branch_to_cave, action: { type: ret_if_flag, flag: enabled } }\n    expect: auto\n").unwrap();
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_iaot"))
         .canonicalize()
         .unwrap();

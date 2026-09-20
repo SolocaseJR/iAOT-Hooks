@@ -458,7 +458,7 @@ fn report_directory(options: &PipelineOptions<'_>, manifest: &Manifest) -> PathB
 
 pub fn prepare(manifest_path: &Path, input_ipa: &Path, reports: &Path) -> anyhow::Result<()> {
     let manifest = manifest::load(manifest_path)?;
-    manifest::validate(&manifest, false)?;
+    manifest::validate(&manifest)?;
     let mut analysis = analyzer::analyze_ipa(input_ipa)?;
     apply_analysis_overrides(&mut analysis, &manifest)?;
     print!("{}", analyzer::human_report(&analysis));
@@ -518,7 +518,7 @@ pub fn run(options: PipelineOptions<'_>) -> anyhow::Result<()> {
         anyhow::bail!("input and output IPA paths must differ")
     }
     let manifest = manifest::load(options.manifest_path)?;
-    manifest::validate(&manifest, false)?;
+    manifest::validate(&manifest)?;
     println!(
         "[1/8] Analyzing decrypted IPA: {}",
         options.input_ipa.display()
