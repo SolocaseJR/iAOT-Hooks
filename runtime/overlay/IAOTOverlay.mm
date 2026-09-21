@@ -37,7 +37,9 @@ std::atomic_bool g_minimized{false};
 float g_minimizedDiameter = 58.0f;
 ImVec2 g_launcherPosition(24.0f, 140.0f);
 std::mutex g_hitRegionMutex;
-CGRect g_menuHitRegion = CGRectNull;
+CGRect g_menuHitRegion = CGRectNull; // bounding box of g_menuHitRects
+std::vector<CGRect> g_menuHitRects;
+bool g_clientDrawsWindows = false; // main-thread only (set at startup)
 ImVec2 g_launcherHitPosition(24.0f, 140.0f);
 const iaot::u32 *g_launcherIconPixels = nullptr;
 iaot::u32 g_launcherIconWidth = 0;
@@ -233,6 +235,36 @@ void PublishMenuHitRegion(const ImVec2 &position, const ImVec2 &size) {
   {
     std::lock_guard<std::mutex> lock(g_hitRegionMutex);
     g_menuHitRegion = CGRectMake(position.x, position.y, size.x, size.y);
+    g_menuHitRects.assign(1, g_menuHitRegion);
+  }
+  ScheduleInputWindowFrameUpdate();
+}
+
+// Client-drawn mode: every visible top-level ImGui window (menu, console,
+// popups) captures touches. The input window spans their bounding box, and
+// pointInside rejects the gaps so the host still receives those touches.
+void PublishClientWindowHitRegions() {
+  ImGuiContext *context = ImGui::GetCurrentContext();
+  if (!context)
+    return;
+  std::vector<CGRect> rects;
+  CGRect bounds = CGRectNull;
+  for (ImGuiWindow *window : context->Windows) {
+    if (!window || !window->Active || window->Hidden)
+      continue;
+    if (window->Flags & ImGuiWindowFlags_ChildWindow)
+      continue;
+    if (window->Size.x <= 0.0f || window->Size.y <= 0.0f)
+      continue;
+    const CGRect rect = CGRectMake(window->Pos.x, window->Pos.y,
+                                   window->Size.x, window->Size.y);
+    rects.push_back(rect);
+    bounds = CGRectUnion(bounds, rect);
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_hitRegionMutex);
+    g_menuHitRects.swap(rects);
+    g_menuHitRegion = bounds;
   }
   ScheduleInputWindowFrameUpdate();
 }
@@ -243,8 +275,13 @@ bool InteractiveRegionContains(CGPoint point) {
                         static_cast<float>(point.y));
   if (g_minimized.load(std::memory_order_acquire))
     return LauncherContains(position, g_launcherHitPosition);
-  return !CGRectIsNull(g_menuHitRegion) &&
-         CGRectContainsPoint(g_menuHitRegion, point);
+  if (CGRectIsNull(g_menuHitRegion) ||
+      !CGRectContainsPoint(g_menuHitRegion, point))
+    return false;
+  for (const CGRect &rect : g_menuHitRects)
+    if (CGRectContainsPoint(rect, point))
+      return true;
+  return false;
 }
 
 // A system Safari/authentication sheet is rendered out-of-process and must be
@@ -419,6 +456,15 @@ void DrawOverlay() {
 
   if (g_minimized.load(std::memory_order_acquire)) {
     DrawFloatingButton();
+    return;
+  }
+
+  if (g_clientDrawsWindows) {
+    if (const auto callback = g_drawCallback.load())
+      callback();
+    // A callback may minimize during this frame; the launcher then owns input.
+    if (!g_minimized.load(std::memory_order_acquire))
+      PublishClientWindowHitRegions();
     return;
   }
 
@@ -773,6 +819,7 @@ bool StartOverlayOnMain(const OverlayOptions &options, OverlayTicket ticket) {
   }
 
   g_minimized.store(options.startMinimized, std::memory_order_release);
+  g_clientDrawsWindows = options.clientDrawsWindows;
   g_minimizedDiameter =
       options.minimizedDiameter > 32.0f ? options.minimizedDiameter : 58.0f;
   g_launcherIconPixels = options.launcherIconRgba;
@@ -996,6 +1043,13 @@ void SetOverlayLauncherIconVariant(u32 variant) {
                               std::memory_order_relaxed);
 }
 bool IsOverlayVisible() { return g_visible.load(std::memory_order_acquire); }
+bool IsOverlayMinimized() {
+  return g_minimized.load(std::memory_order_acquire);
+}
+void SetOverlayMinimized(bool minimized) {
+  g_minimized.store(minimized, std::memory_order_release);
+  ScheduleInputWindowFrameUpdate();
+}
 void SetOverlayVisible(bool visible) {
   dispatch_async(dispatch_get_main_queue(), ^{
     g_visible.store(visible && g_window != nil, std::memory_order_release);

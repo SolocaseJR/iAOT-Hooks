@@ -26,6 +26,10 @@ int main() {
   assert(iaot::GetOverlayStatus() == iaot::OverlayStatus::Unavailable);
   assert(!iaot::StartOverlay());
   assert(!iaot::IsOverlayVisible());
+  iaot::SetOverlayMinimized(false);
+  assert(iaot::IsOverlayMinimized());
+  iaot::OverlayOptions clientOptions;
+  assert(!clientOptions.clientDrawsWindows);
   iaot::SetOverlayVisible(true);
   iaot::StopOverlay();
   return 0;

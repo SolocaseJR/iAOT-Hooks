@@ -26,6 +26,11 @@ struct OverlayOptions {
   u32 launcherAlternateIconWidth{0};
   u32 launcherAlternateIconHeight{0};
   const char *title{nullptr};
+  // When true, the draw callback owns every expanded-mode window (main menu,
+  // consoles, popups) instead of running inside the framework's menu window.
+  // Touches are captured by each visible top-level ImGui window; everything
+  // else passes through to the host. The framework still draws the launcher.
+  bool clientDrawsWindows{false};
 };
 
 // Available when the Theos target is built with IAOT_ENABLE_OVERLAY=1.
@@ -49,6 +54,9 @@ IAOT_EXPORT void SetOverlayLauncherAppearance(u32 backgroundRgba,
 // Selects the primary (0) or alternate (1) launcher icon.
 IAOT_EXPORT void SetOverlayLauncherIconVariant(u32 variant);
 IAOT_EXPORT bool IsOverlayVisible();
+// Expanded menu versus the floating launcher. Safe from the draw callback.
+IAOT_EXPORT bool IsOverlayMinimized();
+IAOT_EXPORT void SetOverlayMinimized(bool minimized);
 IAOT_EXPORT void SetOverlayVisible(bool visible);
 // Temporarily excludes framework-owned windows from a synchronous host capture
 // without changing the user's visible/minimized preference. Safe from either

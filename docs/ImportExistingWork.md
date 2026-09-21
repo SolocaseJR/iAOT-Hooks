@@ -21,6 +21,11 @@ Existing C++ logic and Dear ImGui drawing code can usually be reused. Jailbreak-
 ## Suggested migration order
 
 1. Copy UI drawing into a function with signature `void()` and register it through `SetOverlayDrawCallback`.
+   For a callback that creates its own main window, pop-out consoles, or modal
+   windows, set `OverlayOptions::clientDrawsWindows = true`. IAOT then derives
+   touch regions from every visible top-level ImGui window while leaving gaps
+   touch-through. Use `SetOverlayMinimized(true)` to return to the framework's
+   floating launcher and `IsOverlayMinimized()` to query that state.
 2. Move each hook body into a normal `.cpp` or `.mm` precompiled function.
 3. Describe callback slots, flags, strings, and locators in `hooks.yaml`.
 4. Remove all jailbreak loader and executable-page mutation code.

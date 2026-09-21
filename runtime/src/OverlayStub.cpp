@@ -21,6 +21,8 @@ void SetOverlayDrawCallback(OverlayDrawFn callback) {
   g_drawCallback = callback;
 }
 bool IsOverlayVisible() { return false; }
+bool IsOverlayMinimized() { return true; }
+void SetOverlayMinimized(bool minimized) { IAOT_UNUSED(minimized); }
 void SetOverlayVisible(bool visible) { IAOT_UNUSED(visible); }
 void SetOverlayCaptureHidden(bool hidden) { IAOT_UNUSED(hidden); }
 bool IsOverlayCaptureWindow(const void *window) {
