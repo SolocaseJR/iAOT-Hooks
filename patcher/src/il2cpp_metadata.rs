@@ -59,7 +59,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// arm64 MH_EXECUTE image base. RVA = absolute VA - IMAGE_BASE.
+/// Common arm64 MH_EXECUTE image base. Some Mach-O IL2CPP images use vmaddr 0,
+/// in which case Cpp2IL reports an already image-relative native address.
 /// Matches `macho::image_base` (the main executable's `__TEXT` vmaddr).
 const IMAGE_BASE: u64 = 0x1_0000_0000;
 
@@ -349,15 +350,19 @@ impl MetadataIndex {
                 if !wanted_methods.contains(&key) {
                     continue;
                 }
-                if record.address < IMAGE_BASE {
-                    // No native body (address 0) or unmapped; not usable.
+                if record.address == 0 {
+                    // No native body; not usable.
                     continue;
                 }
                 self.methods.entry(key).or_default().push(MethodHit {
                     assembly: record.assembly,
                     param_count: record.parameters.len(),
                     param_types: record.parameters.into_iter().map(|p| p.ty).collect(),
-                    rva: record.address - IMAGE_BASE,
+                    rva: if record.address >= IMAGE_BASE {
+                        record.address - IMAGE_BASE
+                    } else {
+                        record.address
+                    },
                 });
             }
         }
@@ -731,8 +736,10 @@ struct Cpp2ilMethod {
     #[serde(rename = "declaringType")]
     declaring_type: String,
     name: String,
-    /// Absolute native VA. RVA = address - IMAGE_BASE (NOT the `rva` JSON field;
-    /// see the module header).
+    /// Native address. For the usual 0x100000000 Mach-O base, RVA is address
+    /// minus IMAGE_BASE. For a vmaddr-zero image, address already is the RVA.
+    /// The Cpp2IL `rva` JSON field is intentionally not used; see the module
+    /// header for why it can point past the Mach-O header.
     address: u64,
     #[serde(default)]
     parameters: Vec<Cpp2ilParam>,
@@ -1078,6 +1085,7 @@ mod tests {
         let methods = r#"{"assembly":"UnityEngine.CoreModule","declaringType":"UnityEngine.Camera","name":"WorldToScreenPoint","address":4295000000,"parameters":[{"type":"UnityEngine.Vector3"}]}
 {"assembly":"UnityEngine.CoreModule","declaringType":"UnityEngine.Camera","name":"WorldToScreenPoint","address":4295000100,"parameters":[{"type":"UnityEngine.Vector3"},{"type":"UnityEngine.Camera.MonoOrStereoscopicEye"}]}
 {"assembly":"UnityEngine.CoreModule","declaringType":"UnityEngine.Camera","name":"INTERNAL_CALL_WorldToScreenPoint","address":4295000200,"parameters":[]}
+{"assembly":"Assembly-CSharp","declaringType":"Game.ZeroBased","name":"Tick","address":34081736,"parameters":[]}
 {"assembly":"noise","declaringType":"UnityEngine.Camera","name":"NoBody","address":0,"parameters":[]}
 "#;
         let types = r#"{"assembly":"Assembly-CSharp","fullName":"GameBase.Pawn","fields":[{"name":"m_HeadBone","offset":352,"size":8},{"name":"m_IsAlive","offset":64,"size":1}]}
@@ -1089,6 +1097,7 @@ mod tests {
             &[
                 ("UnityEngine.Camera", "WorldToScreenPoint"),
                 ("UnityEngine.Camera", "INTERNAL_CALL_WorldToScreenPoint"),
+                ("Game.ZeroBased", "Tick"),
             ],
             &[
                 ("GameBase.Pawn", "m_HeadBone"),
@@ -1133,6 +1142,12 @@ mod tests {
                 None
             )
             .is_err());
+        // Mach-O images with vmaddr 0 already report an RVA in `address`.
+        assert_eq!(
+            idx.method_rva("Assembly-CSharp", "Game", "ZeroBased", "Tick", 0, None)
+                .unwrap(),
+            34081736
+        );
         // Field offset + size.
         assert_eq!(
             idx.field("Assembly-CSharp", "GameBase", "Pawn", "m_HeadBone")

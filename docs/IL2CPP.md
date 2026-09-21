@@ -165,11 +165,12 @@ their plain method name. Use a Cpp2IL package when you need that precision.
 
 ### The RVA convention (important)
 
-Every RVA produced is `native_VA - 0x1_0000_0000` (relative to the arm64 image
-base, i.e. the main executable's `__TEXT` vmaddr); the runtime adds the real
-load slide. This is deliberately **not** the Cpp2IL `rva` JSON field, which is
-relative to the tool's `primaryExecutableAddress` (past the Mach-O header) and
-would be short by the header size — iAOT recomputes from the absolute `address`.
+For the common `0x1_0000_0000` arm64 image base, each generated RVA is
+`native_VA - 0x1_0000_0000`. Mach-O images whose `__TEXT` vmaddr is zero already
+carry an image-relative value in Cpp2IL's `address`, so iAOT preserves that value.
+The runtime adds the real load slide in either case. This deliberately avoids
+Cpp2IL's `rva` JSON field, which some packages make relative to the tool's
+`primaryExecutableAddress` after the Mach-O header.
 Il2CppDumper's `Address`/`RVA` are already image-base-relative and used as-is.
 
 The implementation and its unit tests live in

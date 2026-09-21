@@ -53,7 +53,7 @@ rsync -a --delete --exclude='.git/' --exclude='patcher/target/' --exclude='build
 # Reverse-engineering dumps and IDA databases are input material for analysis,
 # not runtime source.  Besides making the sync needlessly large, an open IDA
 # database on the Windows mount can be unreadable from WSL and abort a build.
-rsync -a --delete --exclude='.git/' --exclude='build/' --exclude='artifacts/' --exclude='.theos/' --exclude='Game Data & Dumps/' "$project/" "$stage/project/"
+rsync -a --delete --exclude='.git/' --exclude='build/' --exclude='artifacts/' --exclude='.theos/' --exclude='dumps/' --exclude='Game Data & Dumps/' "$project/" "$stage/project/"
 
 export THEOS="$theos_root"
 debug=1
