@@ -2,7 +2,7 @@
 
 ## Locators
 
-Supported static locators are `pattern`, `xref`, `va`/`vmaddr`, `rva`, `symbol`, `export`, and `il2cpp`. A `custom` locator is a named extension point but is rejected until an offline adapter implements it; arbitrary code from YAML is never executed.
+Supported static locators are `signatures`, `pattern`, `xref`, `va`/`vmaddr`, `rva`, `symbol`, `export`, and `il2cpp`. A `custom` locator is a named extension point but is rejected until an offline adapter implements it; arbitrary code from YAML is never executed.
 
 Patterns use two-digit bytes, `?`/`??` wildcards, and `||` alternatives. They search executable segments by default. `segment`, `section`, `expected_matches`, and `match_index` make intent explicit. Multiple matches without an index fail.
 
@@ -13,6 +13,41 @@ still subjected to normal alignment, range, architecture, version, and
 `expect` validation.
 
 Hardcoded VM addresses and RVAs are version-dependent. Use `versions` and pinned `expect` bytes for build-specific definitions.
+
+### Signatures
+
+A `signatures` locator is the cross-version form. It lists one or more
+instruction-aligned patterns, each of which must match exactly once in the
+executable segments (or pick one with `match_index`):
+
+- `kind: direct` - the match is the target; `offset` (bytes, multiple of 4)
+  moves into it, for a site inside a function.
+- `kind: xref` - the match contains a `B` or `BL` at instruction
+  `branch_index` (default 0) and the branch target is the target. A tail call
+  (`B`) counts, since some functions are only reached that way.
+
+Every signature that resolves must name the same address; if two disagree the
+patch fails instead of guessing. Signatures that do not resolve are reported but
+do not fail the patch while another one resolves. `fallback` is a pinned address
+used only when no signature resolves and the detected app/Unity version is the
+one it names (`patch-macho` takes `--app-version`; the pipeline uses the
+analyzed IPA's versions). Do not combine it with `versions`, which rejects the
+build outright on any other version.
+
+```yaml
+    locator:
+      type: signatures
+      signatures:
+        - { kind: xref, pattern: "? ? ? 94 ? ? ? 11 ? ? ? B9 ? ? ? 17" }
+        - { kind: direct, pattern: "? ? ? 71 ? ? ? 52 ? ? ? 52 28 01 88 9A" }
+      fallback: { rva: 0x265CE40, version: "56.3" }
+    expect: "?? ?? ?? 71"
+```
+
+`expect` accepts `??` wildcards, so it can check the instruction class (for
+example `FF ?? ?? D1` for `sub sp, sp, #imm`) rather than exact bytes that change
+with frame size. Keep register fields exact when an action depends on them. The
+patch report prints how each patch was located.
 
 ## Replacement with callable original
 

@@ -173,7 +173,7 @@ pub fn generate(m: &Manifest, manifest_path: &Path) -> anyhow::Result<()> {
     for x in &m.config.strings {
         writeln!(
             c,
-            "inline const char* IAOTDefaultString_{} = OBF(\"{}\");",
+            "[[maybe_unused]] static const char* IAOTDefaultString_{} = OBF(\"{}\");",
             ident(&x.name),
             c_escape(&x.default)
         )?;
@@ -181,7 +181,7 @@ pub fn generate(m: &Manifest, manifest_path: &Path) -> anyhow::Result<()> {
     for x in &m.config.callbacks {
         writeln!(
             c,
-            "inline const char* IAOTCallbackSymbol_{} = OBF(\"{}\");",
+            "[[maybe_unused]] static const char* IAOTCallbackSymbol_{} = OBF(\"{}\");",
             ident(&x.name),
             c_escape(&x.symbol)
         )?;
@@ -222,7 +222,7 @@ pub fn generate(m: &Manifest, manifest_path: &Path) -> anyhow::Result<()> {
             )?,
             "symbol" => writeln!(
                 f,
-                "inline auto {}(){{return iaot::AppFunction<{}>::FromSymbol(OBF(\"{}\"));}}",
+                "static inline auto {}(){{return iaot::AppFunction<{}>::FromSymbol(OBF(\"{}\"));}}",
                 x.name,
                 sig,
                 c_escape(a.symbol.as_deref().unwrap_or(""))
@@ -274,7 +274,7 @@ pub fn generate(m: &Manifest, manifest_path: &Path) -> anyhow::Result<()> {
             if function.enabled {
                 writeln!(
                     f,
-                    "inline bool Install_{name}(){{return iaot::Replace{}Method(OBF(\"{}\"),OBF(\"{}\"),reinterpret_cast<IMP>(&{}),{});}}",
+                    "static inline bool Install_{name}(){{return iaot::Replace{}Method(OBF(\"{}\"),OBF(\"{}\"),reinterpret_cast<IMP>(&{}),{});}}",
                     if function.class_method { "Class" } else { "Instance" },
                     c_escape(function.class_name.as_deref().unwrap()),
                     c_escape(function.selector.as_deref().unwrap()),
@@ -356,7 +356,7 @@ pub fn generate(m: &Manifest, manifest_path: &Path) -> anyhow::Result<()> {
         ident(&m.analysis.rendering_backend).to_ascii_uppercase());
     writeln!(
         project,
-        "inline iaot::il2cpp::OfflineClassBinding IAOTOfflineClasses[] = {{"
+        "[[maybe_unused]] static iaot::il2cpp::OfflineClassBinding IAOTOfflineClasses[] = {{"
     )?;
     if m.runtime.offline_classes.is_empty() {
         project.push_str("  {},\n");
@@ -373,7 +373,7 @@ pub fn generate(m: &Manifest, manifest_path: &Path) -> anyhow::Result<()> {
     project.push_str("};\n");
     writeln!(
         project,
-        "inline iaot::il2cpp::OfflineMethodBinding IAOTOfflineMethods[] = {{"
+        "[[maybe_unused]] static iaot::il2cpp::OfflineMethodBinding IAOTOfflineMethods[] = {{"
     )?;
     if m.runtime.offline_methods.is_empty() {
         project.push_str("  {},\n");
@@ -394,7 +394,7 @@ pub fn generate(m: &Manifest, manifest_path: &Path) -> anyhow::Result<()> {
     project.push_str("};\n");
     writeln!(
         project,
-        "inline iaot::il2cpp::OfflineFieldBinding IAOTOfflineFields[] = {{"
+        "[[maybe_unused]] static iaot::il2cpp::OfflineFieldBinding IAOTOfflineFields[] = {{"
     )?;
     if m.runtime.offline_fields.is_empty() {
         project.push_str("  {},\n");
@@ -415,7 +415,7 @@ pub fn generate(m: &Manifest, manifest_path: &Path) -> anyhow::Result<()> {
     project.push_str("};\n");
     writeln!(
         project,
-        "inline iaot::il2cpp::OfflineInternalCallBinding IAOTOfflineInternalCalls[] = {{"
+        "[[maybe_unused]] static iaot::il2cpp::OfflineInternalCallBinding IAOTOfflineInternalCalls[] = {{"
     )?;
     if m.runtime.offline_internal_calls.is_empty() {
         project.push_str("  {},\n");
@@ -431,7 +431,7 @@ pub fn generate(m: &Manifest, manifest_path: &Path) -> anyhow::Result<()> {
         )?;
     }
     project.push_str("};\n");
-    writeln!(project, "inline iaot::il2cpp::OfflineMetadata IAOTOfflineMetadata{{IAOTOfflineClasses, {}, IAOTOfflineMethods, {}, IAOTOfflineFields, {}, IAOTOfflineInternalCalls, {}}};",
+    writeln!(project, "[[maybe_unused]] static iaot::il2cpp::OfflineMetadata IAOTOfflineMetadata{{IAOTOfflineClasses, {}, IAOTOfflineMethods, {}, IAOTOfflineFields, {}, IAOTOfflineInternalCalls, {}}};",
              m.runtime.offline_classes.len(), m.runtime.offline_methods.len(),
              m.runtime.offline_fields.len(), m.runtime.offline_internal_calls.len())?;
     fs::write(out.join("IAOTGeneratedProject.hpp"), project)?;
@@ -483,7 +483,24 @@ pub fn generate(m: &Manifest, manifest_path: &Path) -> anyhow::Result<()> {
         m.config.callbacks.iter().filter(|callback| callback.auto_register).count(),
     )?;
     if m.analysis.runtime_il2cpp {
-        writeln!(h, "    RegisterHook({{ OBF(\"IL2CPPRuntimeResolver\"), +[](const HookContext&) -> bool {{ il2cpp::Options options; options.moduleName = *IAOT_IL2CPP_MODULE ? IAOT_IL2CPP_MODULE : nullptr; options.stringFactoryRva = IAOT_IL2CPP_STRING_FACTORY_RVA; options.offlineMetadata = &IAOTOfflineMetadata; return il2cpp::InitializeAsync(options); }} }});")?;
+        // IAOTOfflineClasses/Methods/Fields/InternalCalls are `inline` arrays
+        // whose element initializers (each OBF(...) decrypt) are dynamic, not
+        // constant, initialization. The only reference to them anywhere in
+        // generated code is `&IAOTOfflineMetadata` below, which is an
+        // address-of - a valid constant expression that does NOT odr-use (and
+        // therefore does not force lazy dynamic init of) the arrays it
+        // points into. IL2CPP.mm, which actually reads through that pointer
+        // at runtime, never names these symbols and so can never trigger
+        // their guard either. Left alone, every entry silently stays
+        // zero-initialized (null module/namespc/name/rva) for the process's
+        // whole lifetime, and every offline-table lookup fails as if the
+        // table were empty even though its count is correct. Reading one
+        // field of element [0] from each array (a genuine odr-use, discarded
+        // via the (void) casts) forces that array's *entire* dynamic
+        // initializer to run before the pointer is handed to the resolver.
+        // The generator always emits at least one (possibly dummy) element
+        // per array, so index 0 is valid even when a table is empty.
+        writeln!(h, "    RegisterHook({{ OBF(\"IL2CPPRuntimeResolver\"), +[](const HookContext&) -> bool {{ (void)IAOTOfflineClasses[0].name; (void)IAOTOfflineMethods[0].name; (void)IAOTOfflineFields[0].name; (void)IAOTOfflineInternalCalls[0].name; il2cpp::Options options; options.moduleName = *IAOT_IL2CPP_MODULE ? IAOT_IL2CPP_MODULE : nullptr; options.stringFactoryRva = IAOT_IL2CPP_STRING_FACTORY_RVA; options.offlineMetadata = &IAOTOfflineMetadata; return il2cpp::InitializeAsync(options); }} }});")?;
     } else {
         writeln!(h, "    il2cpp::MarkNotApplicable();")?;
     }

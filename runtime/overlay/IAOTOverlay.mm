@@ -32,6 +32,9 @@ struct OwnedOverlayOptions {
 std::shared_ptr<OwnedOverlayOptions> g_ownedOptions;
 UIWindow *g_window = nil;
 UIWindow *g_inputWindow = nil;
+std::atomic_bool g_systemInputActive{false};
+// Window level of UIKit's keyboard accessory host during text input; 0 = unknown.
+std::atomic<double> g_systemInputCeiling{0};
 UIView *g_renderView = nil;
 std::atomic_bool g_minimized{false};
 float g_minimizedDiameter = 58.0f;
@@ -745,6 +748,22 @@ namespace iaot {
 namespace {
 bool StartOverlayOnMain(const OverlayOptions &options, OverlayTicket ticket);
 
+void ApplySystemInputWindowLevels(bool active) {
+  CGFloat renderLevel = active ? UIWindowLevelNormal + 1.0 : UIWindowLevelAlert + 1.0;
+  CGFloat inputLevel = renderLevel + 1.0;
+  // The accessory row's host window (UITextEffectsWindow) is placed just above
+  // the app's key window, often at Normal+1, which ties with or sits below
+  // the default levels. Stay strictly between the app and that window.
+  const double ceiling = g_systemInputCeiling.load(std::memory_order_acquire);
+  if (active && ceiling > UIWindowLevelNormal && ceiling <= inputLevel) {
+    const CGFloat span = static_cast<CGFloat>(ceiling) - UIWindowLevelNormal;
+    renderLevel = UIWindowLevelNormal + span * 0.25;
+    inputLevel = UIWindowLevelNormal + span * 0.5;
+  }
+  if (g_window) g_window.windowLevel = renderLevel;
+  if (g_inputWindow) g_inputWindow.windowLevel = inputLevel;
+}
+
 void ClearLaunchObservers() {
   NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
   if (g_sceneObserver)
@@ -1061,6 +1080,22 @@ void SetOverlayVisible(bool visible) {
       g_inputWindow.hidden = !visible;
     }
   });
+}
+
+void SetOverlaySystemInputActive(bool active) {
+  g_systemInputActive.store(active, std::memory_order_release);
+  const auto apply = ^{ ApplySystemInputWindowLevels(active); };
+  if (NSThread.isMainThread) apply();
+  else dispatch_async(dispatch_get_main_queue(), apply);
+}
+
+void SetOverlaySystemInputCeiling(double level) {
+  g_systemInputCeiling.store(level, std::memory_order_release);
+  const auto apply = ^{
+    if (g_systemInputActive.load(std::memory_order_acquire)) ApplySystemInputWindowLevels(true);
+  };
+  if (NSThread.isMainThread) apply();
+  else dispatch_async(dispatch_get_main_queue(), apply);
 }
 void SetOverlayCaptureHidden(bool hidden) {
   void (^update)(void) = ^{

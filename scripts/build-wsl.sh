@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 4 ]]; then
-  echo "usage: build-wsl.sh <repo> <project> <output-dylib> <mode>" >&2
+if [[ $# -lt 4 || $# -gt 5 ]]; then
+  echo "usage: build-wsl.sh <repo> <project> <output-dylib> <mode> [code-virtualizer-root]" >&2
   exit 2
 fi
 repo=$1
 project=$2
 output=$3
 mode=$4
+cv_root=${5:-}
 theos_root=${THEOS:-"$HOME/theos"}
 
 for command_name in bash rsync make python3; do
@@ -55,6 +56,17 @@ rsync -a --delete --exclude='.git/' --exclude='patcher/target/' --exclude='build
 # database on the Windows mount can be unreadable from WSL and abort a build.
 rsync -a --delete --exclude='.git/' --exclude='build/' --exclude='artifacts/' --exclude='.theos/' --exclude='dumps/' --exclude='Game Data & Dumps/' "$project/" "$stage/project/"
 
+cv_make_args=()
+if [[ -n "$cv_root" ]]; then
+  sdk_header="$cv_root/Include/C/VirtualizerSDK.h"
+  stealth_header="$cv_root/StealthMode/C/StealthCodeRegsArea/StealthCodeArea.h"
+  [[ -f "$sdk_header" && -f "$stealth_header" ]] || {
+    echo "[cv] ARM64 SDK or stealth headers missing under $cv_root" >&2; exit 17;
+  }
+  python3 "$stage/repo/scripts/verify-cv-input.py" --sdk "$sdk_header"
+  cv_make_args=(IAOT_CODE_VIRTUALIZER=1 "CODEVIRTUALIZER_ROOT=$cv_root")
+fi
+
 export THEOS="$theos_root"
 debug=1
 [[ "$mode" == release ]] && debug=0
@@ -65,7 +77,7 @@ debug=1
 # these makefiles, so a stale object would otherwise be relinked with the wrong
 # flags. Pure source edits leave this fingerprint untouched and stay fully
 # incremental. Set IAOT_FORCE_CLEAN=1 to force a clean rebuild on demand.
-fingerprint=$( { printf 'mode=%s\n' "$mode"; cat "$stage/project/Makefile" "$stage/project/generated/IAOTGeneratedProject.mk"; } 2>/dev/null | sha1sum | cut -d' ' -f1 )
+fingerprint=$( { printf 'mode=%s\ncv_root=%s\n' "$mode" "$cv_root"; cat "$stage/project/Makefile" "$stage/project/generated/IAOTGeneratedProject.mk"; } 2>/dev/null | sha1sum | cut -d' ' -f1 )
 fingerprint_file="$stage/.iaot-config-fingerprint"
 if [[ "${IAOT_FORCE_CLEAN:-0}" == 1 || ! -f "$fingerprint_file" || "$(cat "$fingerprint_file" 2>/dev/null)" != "$fingerprint" ]]; then
   echo "[runtime] build configuration changed (or first build) -> clean rebuild"
@@ -89,7 +101,7 @@ fi
 
 echo "[runtime] building arm64 dylib with Theos (mode=$mode, jobs=$jobs)"
 echo "[runtime] stage: $stage"
-make -C "$stage/project" -j"$jobs" IAOT_ROOT="$stage/repo" DEBUG="$debug"
+make -C "$stage/project" -j"$jobs" IAOT_ROOT="$stage/repo" DEBUG="$debug" "${cv_make_args[@]}"
 
 # Only record the fingerprint after a successful build so an interrupted or
 # failed compile re-cleans next time instead of trusting a half-built cache.

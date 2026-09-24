@@ -58,6 +58,13 @@ IAOT_EXPORT bool IsOverlayVisible();
 IAOT_EXPORT bool IsOverlayMinimized();
 IAOT_EXPORT void SetOverlayMinimized(bool minimized);
 IAOT_EXPORT void SetOverlayVisible(bool visible);
+// Temporarily lower the overlay while UIKit owns a text-input session. This
+// keeps the system keyboard and its accessory view above the Metal menu.
+IAOT_EXPORT void SetOverlaySystemInputActive(bool active);
+// During that session, the window level of UIKit's keyboard accessory host.
+// When it is at or below the lowered overlay, the overlay moves between the
+// app (UIWindowLevelNormal) and that level so the accessory row stays on top.
+IAOT_EXPORT void SetOverlaySystemInputCeiling(double level);
 // Temporarily excludes framework-owned windows from a synchronous host capture
 // without changing the user's visible/minimized preference. Safe from either
 // the main thread or a capture worker.

@@ -27,6 +27,7 @@ struct HookPatchRecord {
     vmaddr: String,
     displaced_bytes: String,
     original_vmaddr: Option<String>,
+    located_by: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -319,19 +320,24 @@ fn patch_extracted_modules(
             &output,
             macho::PatchOptions {
                 load_dylib: load_runtime && member == analysis.executable_member,
+                app_versions: detected_versions(analysis)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
             },
         )
         .map_err(|error| error.context(format!("failed to patch {member}")))?;
         for resolution in patch_report.resolutions {
             println!(
-                "  hook {} -> {} @ 0x{:x}; original={}",
+                "  hook {} -> {} @ 0x{:x}; original={}; located by {}",
                 resolution.name,
                 member,
                 resolution.vmaddr,
                 resolution
                     .original_vmaddr
                     .map(|address| format!("0x{address:x}"))
-                    .unwrap_or_else(|| "not requested".into())
+                    .unwrap_or_else(|| "not requested".into()),
+                resolution.located_by
             );
             applied_hooks.push(HookPatchRecord {
                 name: resolution.name,
@@ -346,6 +352,7 @@ fn patch_extracted_modules(
                 original_vmaddr: resolution
                     .original_vmaddr
                     .map(|address| format!("0x{address:x}")),
+                located_by: resolution.located_by,
             });
         }
         for failure in patch_report.failures {

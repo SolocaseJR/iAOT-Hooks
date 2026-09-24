@@ -1,7 +1,10 @@
 use crate::{
     arm64,
     caves::{self, CaveRequest},
-    manifest::{FailureBehavior, Locator, Manifest, Patch, PatchAction},
+    manifest::{
+        FailureBehavior, Locator, Manifest, Patch, PatchAction, Signature, SignatureKind,
+        VersionedRva,
+    },
     pattern,
 };
 use object::{Object, ObjectSegment, ObjectSymbol};
@@ -449,16 +452,107 @@ fn pattern_hits(
         executable_ranges(parsed, data.len())
     };
     for range in ranges {
+        // Only instruction starts can match, so test aligned offsets only.
+        let start = range.start + (4 - range.start % 4) % 4;
+        if start >= range.end {
+            continue;
+        }
         for p in &alternatives {
-            for local in pattern::find(&data[range.clone()], p) {
-                let off = range.start + local;
-                if off % 4 == 0 {
-                    hits.push(off)
-                }
+            for local in pattern::find_aligned(&data[start..range.end], p, 4) {
+                hits.push(start + local)
             }
         }
     }
     Ok(hits)
+}
+/// File offset of the target one signature points at.
+fn resolve_signature(
+    data: &[u8],
+    parsed: &Parsed,
+    signature: &Signature,
+) -> anyhow::Result<usize> {
+    let hits = pattern_hits(data, parsed, &signature.pattern, None, None)?;
+    let hit = match (signature.match_index, hits.len()) {
+        (None, 0) => anyhow::bail!("no match"),
+        (None, 1) => hits[0],
+        (None, count) => anyhow::bail!("{count} matches"),
+        (Some(_), _) => choose(hits, signature.match_index, "signature")?,
+    };
+    match signature.kind {
+        SignatureKind::Direct => {
+            let target = (hit as i128) + signature.offset.unwrap_or(0) as i128;
+            let target = usize::try_from(target)
+                .map_err(|_| anyhow::anyhow!("offset moves the target before the file"))?;
+            file_to_vm(parsed, target)?;
+            Ok(target)
+        }
+        SignatureKind::Xref => {
+            let pos = hit + signature.branch_index.unwrap_or(0) * 4;
+            let instruction = u32at(data, pos)?;
+            let target = pattern::resolve_branch_target(instruction, file_to_vm(parsed, pos)?)?;
+            vm_to_file(parsed, target)
+        }
+    }
+}
+/// Resolves a `signatures` locator; returns the target and how it was found.
+fn locate_signatures(
+    data: &[u8],
+    parsed: &Parsed,
+    label: &str,
+    signatures: &[Signature],
+    fallback: Option<&VersionedRva>,
+    versions: &[String],
+) -> anyhow::Result<(usize, String)> {
+    let mut resolved = Vec::new();
+    let mut problems = Vec::new();
+    for (index, signature) in signatures.iter().enumerate() {
+        match resolve_signature(data, parsed, signature) {
+            Ok(off) => resolved.push((index + 1, off)),
+            Err(error) => problems.push(format!("signature {} ({:?}): {error}", index + 1, signature.kind)),
+        }
+    }
+    if let Some(&(_, first)) = resolved.first() {
+        if resolved.iter().any(|&(_, off)| off != first) {
+            let found = resolved
+                .iter()
+                .map(|&(number, off)| {
+                    let vm = file_to_vm(parsed, off).unwrap_or(0);
+                    format!("signature {number} -> 0x{vm:x}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!("{label}: signatures disagree ({found}); refusing to guess")
+        }
+        let numbers = resolved
+            .iter()
+            .map(|(number, _)| number.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut source = format!("signature {numbers} of {}", signatures.len());
+        if !problems.is_empty() {
+            source += &format!("; unresolved: {}", problems.join("; "));
+        }
+        return Ok((first, source));
+    }
+    let problems = problems.join("; ");
+    match fallback {
+        Some(fallback) if versions.iter().any(|version| *version == fallback.version) => {
+            let off = vm_to_file(parsed, image_base(parsed)? + fallback.rva)?;
+            Ok((
+                off,
+                format!(
+                    "fallback rva 0x{:x} for version {} (no signature resolved: {problems})",
+                    fallback.rva, fallback.version
+                ),
+            ))
+        }
+        Some(fallback) => anyhow::bail!(
+            "{label}: no signature resolved ({problems}); the fallback rva is only valid for version {} and the detected versions are [{}]",
+            fallback.version,
+            versions.join(", ")
+        ),
+        None => anyhow::bail!("{label}: no signature resolved ({problems})"),
+    }
 }
 fn symbol_address(data: &[u8], name: &str) -> anyhow::Result<u64> {
     let file = object::File::parse(data)?;
@@ -570,10 +664,21 @@ fn locate(
     parsed: &Parsed,
     manifest: &Manifest,
     patch: &Patch,
-) -> anyhow::Result<(usize, u64)> {
+    versions: &[String],
+) -> anyhow::Result<(usize, u64, String)> {
     let locator = &patch.locator;
     let label = &patch.name;
+    let mut source = locator_name(locator).to_string();
     let off = match locator {
+        Locator::Signatures {
+            signatures,
+            fallback,
+        } => {
+            let (off, found) =
+                locate_signatures(data, parsed, label, signatures, fallback.as_ref(), versions)?;
+            source = found;
+            off
+        }
         Locator::Pattern {
             pattern,
             match_index,
@@ -596,7 +701,10 @@ fn locate(
 
             match (pattern_result, fallback_rva) {
                 (Ok(off), _) => off,
-                (Err(_), Some(rva)) => vm_to_file(parsed, image_base(parsed)? + *rva)?,
+                (Err(_), Some(rva)) => {
+                    source = format!("fallback rva 0x{rva:x}");
+                    vm_to_file(parsed, image_base(parsed)? + *rva)?
+                }
                 (Err(error), None) => return Err(error),
             }
         }
@@ -649,7 +757,32 @@ fn locate(
     if off % 4 != 0 {
         anyhow::bail!("{label}: resolved target is unaligned")
     }
-    Ok((off, file_to_vm(parsed, off)?))
+    Ok((off, file_to_vm(parsed, off)?, source))
+}
+fn locator_name(locator: &Locator) -> &'static str {
+    match locator {
+        Locator::Pattern { .. } => "pattern",
+        Locator::Xref { .. } => "xref",
+        Locator::Signatures { .. } => "signatures",
+        Locator::Symbol { .. } => "symbol",
+        Locator::Export { .. } => "export",
+        Locator::Va { .. } | Locator::Vmaddr { .. } => "fixed vmaddr",
+        Locator::Rva { .. } => "fixed rva",
+        Locator::Il2cpp { .. } => "il2cpp method map",
+        Locator::Custom { .. } => "custom",
+    }
+}
+/// `expect` may use wildcards so one expectation holds across versions.
+fn expect_matches(expect: &str, bytes: &[u8; 4]) -> anyhow::Result<bool> {
+    let parsed = pattern::parse(expect)?;
+    let expected = &parsed[0].0;
+    if expected.len() != 4 {
+        anyhow::bail!("expect must be exactly four bytes or wildcards")
+    }
+    Ok(expected
+        .iter()
+        .zip(bytes)
+        .all(|(want, have)| want.is_none_or(|value| value == *have)))
 }
 fn config_bytes(m: &Manifest) -> Vec<u8> {
     let mut c = vec![0u8; CONFIG_SIZE];
@@ -678,14 +811,6 @@ fn config_bytes(m: &Manifest) -> Vec<u8> {
     }
     c
 }
-fn expected_bytes(text: &str) -> anyhow::Result<[u8; 4]> {
-    let p = pattern::parse(text)?;
-    let mut out = [0; 4];
-    for (i, b) in p[0].0.iter().enumerate() {
-        out[i] = b.unwrap()
-    }
-    Ok(out)
-}
 
 #[derive(Debug)]
 pub struct PatchReport {
@@ -705,16 +830,22 @@ pub struct PatchResolution {
     pub bytes: [u8; 4],
     pub automatic: bool,
     pub original_vmaddr: Option<u64>,
+    /// How the target was found, e.g. "signature 1, 2 of 2" or a fallback.
+    pub located_by: String,
 }
 #[derive(Debug)]
 pub struct PatchFailure {
     pub name: String,
     pub reason: String,
 }
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct PatchOptions {
     pub load_dylib: bool,
+    /// Detected app/Unity versions; a `signatures` fallback rva is used only
+    /// when its version is among them.
+    pub app_versions: Vec<String>,
 }
+#[cfg(test)]
 pub fn patch(m: &Manifest, input: &Path, output: &Path) -> anyhow::Result<PatchReport> {
     patch_with_options(m, input, output, PatchOptions::default())
 }
@@ -776,22 +907,27 @@ pub fn patch_with_options(
     let mut resolutions = Vec::new();
     let mut failures = Vec::new();
     let mut target_offsets = HashSet::new();
+    let mut sources: HashMap<String, String> = HashMap::new();
     for p in m.patches.iter().filter(|p| p.enabled) {
         let resolved = (|| -> anyhow::Result<_> {
-            let (off, vm) = locate(&original, &parsed, m, p)?;
+            let (off, vm, source) = locate(&original, &parsed, m, p, &options.app_versions)?;
             let bytes: [u8; 4] = original
                 .get(off..off + 4)
                 .ok_or_else(|| anyhow::anyhow!("resolved instruction is truncated"))?
                 .try_into()
                 .unwrap();
             if let Some(expect) = &p.expect {
-                if expect != "auto" && bytes != expected_bytes(expect)? {
-                    anyhow::bail!("expected bytes do not match")
+                if expect != "auto" && !expect_matches(expect, &bytes)? {
+                    anyhow::bail!(
+                        "expected bytes do not match at 0x{vm:x} (found {:02X} {:02X} {:02X} {:02X}, located by {source})",
+                        bytes[0], bytes[1], bytes[2], bytes[3]
+                    )
                 }
             }
             if !target_offsets.insert(off) {
                 anyhow::bail!("another enabled patch already targets file offset 0x{off:x}")
             }
+            sources.insert(p.name.clone(), source);
             Ok((off, vm, bytes, u32::from_le_bytes(bytes)))
         })();
         let (off, vm, bytes, displaced) = match resolved {
@@ -850,6 +986,7 @@ pub fn patch_with_options(
                 bytes,
                 automatic: patch.expect.as_deref().is_none_or(|value| value == "auto"),
                 original_vmaddr: None,
+                located_by: sources.remove(&patch.name).unwrap_or_default(),
             });
             direct_rewrites.push((off, vm, target_vm));
         } else {
@@ -967,6 +1104,7 @@ pub fn patch_with_options(
             bytes: displaced_bytes,
             automatic: p.expect.as_deref().is_none_or(|x| x == "auto"),
             original_vmaddr: original_vm,
+            located_by: sources.remove(&p.name).unwrap_or_default(),
         });
         cave.extend_from_slice(&bytes);
         redirects.push((off, vm, bridge_address, patch_width));
@@ -1473,6 +1611,107 @@ mod tests {
         serde_yaml::from_str("project: { name: Demo, bundle_id: com.example.demo, platform: ios, arch: arm64, min_ios: '14.0' }\nruntime: { config_segment: __IAOTCFG, cave_segment: __IAOTCAVE, page_size: 16384, dylib_name: Demo.dylib }\napp: {}\nconfig:\n  flags: [{ name: enabled, index: 0, default: true }]\n  strings: [{ name: text, index: 0, default: hello }]\n  callbacks: []\nfunctions: []\ngenerated_hooks: []\npatches:\n  - name: test\n    enabled: true\n    description: owned synthetic fixture\n    locator: { type: va, value: 0x100000400 }\n    patch: { type: branch_to_cave, action: { type: ret_if_flag, flag: enabled } }\n    expect: '1F 20 03 D5'\n").unwrap()
     }
 
+    /// Target function at 0x800, a BL to it at 0x600 and a tail-call B at 0x704.
+    fn signature_fixture() -> Vec<u8> {
+        let mut d = fixture(0x400, 0xd503201f);
+        for (index, word) in [0xd10043ffu32, 0x52800540, 0x910043ff, 0xd65f03c0]
+            .into_iter()
+            .enumerate()
+        {
+            put32(&mut d, 0x800 + index * 4, word);
+        }
+        put32(&mut d, 0x600, 0x9400_0080); // bl 0x800
+        put32(&mut d, 0x604, 0xaa1303e0); // mov x0, x19
+        put32(&mut d, 0x700, 0xd280_0000); // mov x0, #0
+        put32(&mut d, 0x704, 0x1400_003f); // b 0x800
+        d
+    }
+
+    fn signature(kind: SignatureKind, pattern: &str) -> Signature {
+        Signature {
+            kind,
+            pattern: pattern.into(),
+            branch_index: None,
+            offset: None,
+            match_index: None,
+        }
+    }
+
+    #[test]
+    fn signatures_agree_across_direct_xref_and_tail_call() {
+        let d = signature_fixture();
+        let parsed = parse(&d).unwrap();
+        let mut tail = signature(SignatureKind::Xref, "00 00 80 D2 ?? ?? ?? 14");
+        tail.branch_index = Some(1);
+        let signatures = [
+            signature(SignatureKind::Direct, "FF 43 00 D1 40 05 80 52"),
+            signature(SignatureKind::Xref, "?? ?? ?? 94 E0 03 13 AA"),
+            tail,
+            signature(SignatureKind::Direct, "DE AD BE EF"),
+        ];
+        let (off, source) = locate_signatures(&d, &parsed, "t", &signatures, None, &[]).unwrap();
+        assert_eq!(off, 0x800);
+        assert!(source.starts_with("signature 1, 2, 3 of 4"), "{source}");
+        assert!(source.contains("signature 4 (Direct): no match"), "{source}");
+    }
+
+    #[test]
+    fn direct_offset_reaches_a_site_inside_the_match() {
+        let d = signature_fixture();
+        let parsed = parse(&d).unwrap();
+        let mut site = signature(SignatureKind::Direct, "FF 43 00 D1 40 05 80 52");
+        site.offset = Some(8);
+        let (off, _) = locate_signatures(&d, &parsed, "t", &[site], None, &[]).unwrap();
+        assert_eq!(off, 0x808);
+    }
+
+    #[test]
+    fn disagreeing_signatures_are_refused() {
+        let d = signature_fixture();
+        let parsed = parse(&d).unwrap();
+        let mut shifted = signature(SignatureKind::Direct, "FF 43 00 D1 40 05 80 52");
+        shifted.offset = Some(4);
+        let signatures = [
+            signature(SignatureKind::Xref, "?? ?? ?? 94 E0 03 13 AA"),
+            shifted,
+        ];
+        let error = locate_signatures(&d, &parsed, "t", &signatures, None, &[]).unwrap_err();
+        assert!(error.to_string().contains("disagree"), "{error}");
+    }
+
+    #[test]
+    fn fallback_rva_is_used_only_for_its_version() {
+        let d = signature_fixture();
+        let parsed = parse(&d).unwrap();
+        let signatures = [signature(SignatureKind::Direct, "DE AD BE EF")];
+        let fallback = VersionedRva {
+            rva: 0x800,
+            version: "56.3".into(),
+        };
+        let (off, source) = locate_signatures(
+            &d,
+            &parsed,
+            "t",
+            &signatures,
+            Some(&fallback),
+            &["6000.0.58f2".into(), "56.3".into()],
+        )
+        .unwrap();
+        assert_eq!(off, 0x800);
+        assert!(source.starts_with("fallback rva 0x800 for version 56.3"), "{source}");
+        let error = locate_signatures(&d, &parsed, "t", &signatures, Some(&fallback), &["57.0".into()])
+            .unwrap_err();
+        assert!(error.to_string().contains("only valid for version 56.3"), "{error}");
+    }
+
+    #[test]
+    fn wildcard_expect_matches_instruction_class() {
+        let sub_sp = 0xd10043ffu32.to_le_bytes();
+        assert!(expect_matches("FF ?? ?? D1", &sub_sp).unwrap());
+        assert!(!expect_matches("FF ?? ?? 91", &sub_sp).unwrap());
+        assert!(expect_matches("FF 43 00 D1", &sub_sp).unwrap());
+    }
+
     #[test]
     fn writes_segments_redirect_and_preserves_signature_command_for_resigning() {
         let dir = tempdir().unwrap();
@@ -1587,7 +1826,16 @@ mod tests {
         let mut m = manifest();
         m.patches[0].expect = Some("auto".into());
         let report =
-            patch_with_options(&m, &input, &output, PatchOptions { load_dylib: true }).unwrap();
+            patch_with_options(
+                &m,
+                &input,
+                &output,
+                PatchOptions {
+                    load_dylib: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(report.resolutions[0].automatic);
         assert_eq!(report.resolutions[0].bytes, [0x1f, 0x20, 0x03, 0xd5]);
         assert!(report.added_dylib_load_command);

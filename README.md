@@ -2,6 +2,9 @@
 
 IAOT is a reusable C++17/Objective-C++ and Rust framework for offline instrumentation of decrypted iOS applications that you own or are authorized to modify. It targets jailed, no-JIT ARM64 deployments: hook callbacks, trampolines, and the runtime dylib are compiled before the final app is signed.
 
+In simple words: iAOT is a framework created to relatively easily apply hooks and menu overlays to iOS apps, even if they're jailed. 
+I made it because I found virtually nothing anywhere on how to make toggle-able mods and working hooks for Jailed, no-JIT iOS apps.
+
 IAOT does not decrypt IPAs, bypass DRM, obtain signing identities, attach to installed processes, or install unsigned runtime code. See [Responsible Use](RESPONSIBLE_USE.md).
 
 ## What works

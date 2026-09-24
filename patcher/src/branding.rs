@@ -214,7 +214,7 @@ pub fn prepare(
             manifest.source_dir.join(configured)
         }
     });
-    if display_name.is_none() && icon_path.is_none() {
+    if display_name.is_none() && icon_path.is_none() && !manifest.app.remove_supported_devices {
         return Ok(BrandingArtifacts::default());
     }
 
@@ -223,6 +223,9 @@ pub fn prepare(
     let mut info = read_plist(&info_source)?;
     {
         let root = dictionary(&mut info)?;
+        if manifest.app.remove_supported_devices {
+            root.remove("UISupportedDevices");
+        }
         if let Some(name) = &display_name {
             root.insert("CFBundleDisplayName".into(), Value::String(name.clone()));
         }
@@ -267,4 +270,37 @@ pub fn prepare(
         }
     }
     Ok(artifacts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn device_allowlist_is_removed_only_when_enabled_without_branding() {
+        for enabled in [None, Some(false), Some(true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("input");
+            fs::create_dir_all(&source).unwrap();
+            let mut root = Dictionary::new();
+            root.insert("UISupportedDevices".into(), Value::Array(vec![Value::String("iPad1,1".into())]));
+            root.insert("UIDeviceFamily".into(), Value::Array(vec![Value::Integer(1.into()), Value::Integer(2.into())]));
+            write_binary_plist(&Value::Dictionary(root), &source.join("Info.plist")).unwrap();
+            let option = enabled.map(|v| format!("remove_supported_devices: {v}")).unwrap_or_default();
+            let manifest: Manifest = serde_yaml::from_str(&format!(
+                "project: {{ name: Test, bundle_id: test, platform: ios, arch: arm64, min_ios: '14.0' }}\nruntime: {{ config_segment: __CFG, cave_segment: __CAVE, page_size: 16384, dylib_name: Test.dylib }}\napp: {{ {option} }}\n"
+            )).unwrap();
+            let out = dir.path().join("out");
+            let artifacts = prepare(&manifest, "Payload/Test.app", "Info.plist", &source, &out).unwrap();
+            let plist = if enabled == Some(true) {
+                assert_eq!(artifacts.replacements.len(), 1);
+                read_plist(&out.join("Info.plist")).unwrap()
+            } else {
+                assert!(artifacts.replacements.is_empty());
+                read_plist(&source.join("Info.plist")).unwrap()
+            };
+            let dict = plist.as_dictionary().unwrap();
+            assert_eq!(dict.contains_key("UISupportedDevices"), enabled != Some(true));
+            assert!(dict.contains_key("UIDeviceFamily"));
+        }
+    }
 }

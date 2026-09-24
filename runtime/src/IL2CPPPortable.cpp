@@ -39,9 +39,9 @@ Il2CppString *New(const char *) { return nullptr; }
 std::string ToUtf8(const Il2CppString *) { return {}; }
 } // namespace String
 namespace GC {
-std::uint32_t Pin(Il2CppObject *) { return 0; }
-Il2CppObject *GetTarget(std::uint32_t) { return nullptr; }
-void Unpin(std::uint32_t) {}
+Handle Pin(Il2CppObject *) { return 0; }
+Il2CppObject *GetTarget(Handle) { return nullptr; }
+void Unpin(Handle) {}
 } // namespace GC
 namespace Field {
 std::size_t Offset(const FieldInfo *) { return 0; }

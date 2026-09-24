@@ -82,6 +82,9 @@ enum Cmd {
         output: PathBuf,
         #[arg(long)]
         load_dylib: bool,
+        /// App/Unity version of the input, enabling version-pinned fallbacks.
+        #[arg(long = "app-version")]
+        app_versions: Vec<String>,
     },
     PatchIpa {
         #[arg(long)]
@@ -133,6 +136,7 @@ fn print_patch_report(report: &macho::PatchReport) {
                 ""
             }
         );
+        println!("  located by {}", resolution.located_by);
         if let Some(original) = resolution.original_vmaddr {
             println!("  callable original trampoline: 0x{original:x}");
         }
@@ -341,18 +345,18 @@ fn main() -> anyhow::Result<()> {
             input,
             output,
             load_dylib,
+            app_versions,
         } => {
             let m = validated(&manifest)?;
-            let report = if load_dylib {
-                macho::patch_with_options(
-                    &m,
-                    &input,
-                    &output,
-                    macho::PatchOptions { load_dylib: true },
-                )?
-            } else {
-                macho::patch(&m, &input, &output)?
-            };
+            let report = macho::patch_with_options(
+                &m,
+                &input,
+                &output,
+                macho::PatchOptions {
+                    load_dylib,
+                    app_versions,
+                },
+            )?;
             print_patch_report(&report);
             println!("The output must be signed/re-signed.");
         }
@@ -387,6 +391,7 @@ fn main() -> anyhow::Result<()> {
                 &patched,
                 macho::PatchOptions {
                     load_dylib: dylib.is_some(),
+                    ..Default::default()
                 },
             )?;
             let addition = if let Some(path) = dylib.as_deref() {

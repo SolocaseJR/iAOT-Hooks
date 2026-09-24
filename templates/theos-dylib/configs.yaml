@@ -35,6 +35,8 @@ runtime:
   dylib_name: "ExampleHooks.dylib"
 
 app:
+  # Remove only the device-model allowlist in the main Info.plist.
+  remove_supported_devices: false
   executable_member: null
   prefer_unity_framework: true
   target_module: null

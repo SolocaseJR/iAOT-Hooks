@@ -312,10 +312,10 @@ static void obfusheader_decoy_10() { obfusheader_decoy_main(); }
 #endif
 
 // Normal & threadlocal encryption modes
-#define OBF_KEY_NORMAL(x, type, size, key) []() {\
-    constexpr static auto result = obf::obfuscator<type, size, key>(x);\
+#define OBF_KEY_NORMAL(x, type, size, key) []() -> auto& {\
+    static auto result = obf::obfuscator<type, size, key>(x);\
     return result; }() 
-#define OBF_KEY_THREADLOCAL(x, type, size, key) []() {\
+#define OBF_KEY_THREADLOCAL(x, type, size, key) []() -> auto& {\
     constexpr static auto data = obf::obfuscator<type, size, key>(x);\
     thread_local auto decryptor = obf::decryptor<type, size, key>(data);\
     return decryptor; }()

@@ -3,7 +3,9 @@ param(
     [string]$InputIpa,
     [Parameter(Mandatory=$true)][string]$Manifest,
     [string]$OutputIpa,
-    [string]$Distro = $env:IAOT_WSL_DISTRO
+    [string]$Distro = $env:IAOT_WSL_DISTRO,
+    [string]$CodeVirtualizerRoot,
+    [string]$CodeVirtualizerProject
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -21,6 +23,13 @@ function Clear-TransientBuildOutput {
     }
 }
 
+function Get-Sha256([string]$Path) {
+    $hash = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try { return [Convert]::ToBase64String($hash.ComputeHash($stream)) }
+    finally { $stream.Dispose(); $hash.Dispose() }
+}
+
 trap {
     Clear-TransientBuildOutput
     break
@@ -30,6 +39,17 @@ Clear-TransientBuildOutput
 $manifestPath = [IO.Path]::GetFullPath($Manifest)
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "[config] manifest not found: $manifestPath" }
 $project = Split-Path -Parent $manifestPath
+$cvEnabled = -not [string]::IsNullOrWhiteSpace($CodeVirtualizerRoot)
+if ($cvEnabled) {
+    if ([string]::IsNullOrWhiteSpace($CodeVirtualizerProject)) {
+        throw '[cv] -CodeVirtualizerProject is required with -CodeVirtualizerRoot'
+    }
+    $CodeVirtualizerRoot = [IO.Path]::GetFullPath($CodeVirtualizerRoot)
+    $CodeVirtualizerProject = [IO.Path]::GetFullPath($CodeVirtualizerProject)
+    $cvExe = Join-Path $CodeVirtualizerRoot 'VirtualizerArm64.exe'
+    if (-not (Test-Path -LiteralPath $cvExe -PathType Leaf)) { throw "[cv] ARM64 CLI not found: $cvExe" }
+    if (-not (Test-Path -LiteralPath $CodeVirtualizerProject -PathType Leaf)) { throw "[cv] project not found: $CodeVirtualizerProject" }
+}
 
 foreach ($commandName in @('cargo','wsl.exe')) {
     if (-not (Get-Command $commandName -ErrorAction SilentlyContinue)) { throw "[dependency] $commandName was not found on PATH" }
@@ -134,10 +154,43 @@ if ($LASTEXITCODE -ne 0) { throw '[analysis] IPA analysis or source generation f
 
 $mode = [string]$resolved.build_mode
 if ($mode -notin @('development', 'release')) { throw "[config] resolved build mode is invalid: $mode" }
+if ($cvEnabled -and $mode -ne 'release') { throw '[cv] Code Virtualizer requires build.mode: release' }
 Write-Host '[4/6] Building the precompiled runtime in WSL/Theos'
-& wsl.exe -d $Distro -- bash $scriptWsl $repoWsl $projectWsl $runtimeWsl $mode
+if ($cvEnabled) {
+    $cvRootWsl = Convert-ToWsl $CodeVirtualizerRoot
+    & wsl.exe -d $Distro -- bash $scriptWsl $repoWsl $projectWsl $runtimeWsl $mode $cvRootWsl
+} else {
+    & wsl.exe -d $Distro -- bash $scriptWsl $repoWsl $projectWsl $runtimeWsl $mode
+}
 if ($LASTEXITCODE -ne 0) { throw '[runtime] WSL/Theos build failed; see the dependency or compiler error above' }
 if (-not (Test-Path -LiteralPath $runtimeWindows -PathType Leaf)) { throw '[runtime] WSL did not copy the dylib back to Windows' }
+
+if ($cvEnabled) {
+    $cvVerify = Join-Path $repo 'scripts\verify-cv-input.py'
+    & python $cvVerify --binary $runtimeWindows
+    if ($LASTEXITCODE -ne 0) { throw '[cv] compiled dylib lacks ARM64 stealth markers' }
+    $protectedRuntime = Join-Path $buildRoot 'runtime\IAOTRuntime-protected.dylib'
+    Write-Host '[cv] Protecting the freshly built dylib with Code Virtualizer'
+    # VirtualizerArm64.exe is a Windows GUI-subsystem executable. PowerShell's
+    # call operator can return before it finishes; wait for the actual process.
+    $cvArguments = '/protect "{0}" /inputfile "{1}" /outputfile "{2}" /shareconsole' -f `
+        $CodeVirtualizerProject, $runtimeWindows, $protectedRuntime
+    $cvProcess = Start-Process -FilePath $cvExe -ArgumentList $cvArguments -PassThru -Wait -WindowStyle Hidden
+    if ($cvProcess.ExitCode -ne 0) { throw "[cv] Code Virtualizer exited $($cvProcess.ExitCode); unprotected dylib will not be packaged" }
+    if (-not (Test-Path -LiteralPath $protectedRuntime -PathType Leaf)) { throw '[cv] protected dylib missing' }
+    if ((Get-Sha256 $runtimeWindows) -eq (Get-Sha256 $protectedRuntime)) {
+        throw '[cv] protected dylib is byte-identical to the input'
+    }
+    Write-Host '[cv] Stripping and checking protected Mach-O symbols'
+    $finalizeWsl = Convert-ToWsl (Join-Path $repo 'scripts\finalize-cv.sh')
+    $protectedWsl = Convert-ToWsl $protectedRuntime
+    $verifyWsl = Convert-ToWsl $cvVerify
+    & wsl.exe -d $Distro -- bash $finalizeWsl $protectedWsl $verifyWsl
+    if ($LASTEXITCODE -ne 0) { throw '[cv] protected dylib symbol finalization failed' }
+    & python $cvVerify --final-symbols $protectedRuntime
+    if ($LASTEXITCODE -ne 0) { throw '[cv] protected dylib still exposes project symbols' }
+    $runtimeWindows = $protectedRuntime
+}
 
 Write-Host '[5/6] Patching, injecting, repackaging, and validating'
 & $iaot pipeline --manifest $manifestPath --in $inputPath --out $outputPath --dylib $runtimeWindows --reports $reports

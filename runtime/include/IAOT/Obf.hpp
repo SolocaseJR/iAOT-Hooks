@@ -13,6 +13,7 @@
 // development builds stay readable and release builds ship obfuscated.
 // It can still be overridden with -DIAOT_ENABLE_OBF=0/1 directly.
 #pragma once
+#include <cstddef>
 
 #ifndef IAOT_ENABLE_OBF
 #define IAOT_ENABLE_OBF 0
@@ -73,4 +74,13 @@
 // Usage: OBFNS("com.example.endpoint").
 #if defined(__OBJC__)
 #define OBFNS(cstr) ([NSString stringWithUTF8String:(OBF(cstr))])
+#endif
+
+// Obfuscate integral constants used for protocol and lookup values. These are
+// convenience aliases matching Aurora's value-obfuscation convention.
+#ifndef OBFULL
+#define OBFULL(value) (OBF((unsigned long long)(value)))
+#endif
+#ifndef OBFUSPTR
+#define OBFUSPTR(value) (OBF((unsigned long long)(value)))
 #endif

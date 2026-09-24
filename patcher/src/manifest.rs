@@ -132,6 +132,9 @@ fn default_parameter_count() -> i32 {
 pub const DEFAULT_FIELD_SIZE: u64 = 8;
 #[derive(Clone, Debug, Deserialize)]
 pub struct App {
+    /// Remove the device-model allowlist from the main app's Info.plist.
+    #[serde(default)]
+    pub remove_supported_devices: bool,
     pub executable_member: Option<String>,
     #[serde(default)]
     pub prefer_unity_framework: bool,
@@ -334,6 +337,13 @@ pub enum Locator {
         xref_match_index: Option<usize>,
         xref_bl_index: Option<usize>,
     },
+    /// Several independent signatures for one target. Every signature that
+    /// resolves must agree; `fallback` is used only when none resolves and
+    /// the detected app/Unity version equals `fallback.version`.
+    Signatures {
+        signatures: Vec<Signature>,
+        fallback: Option<VersionedRva>,
+    },
     Symbol {
         symbol: String,
     },
@@ -363,6 +373,37 @@ pub enum Locator {
         resolver: String,
         value: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureKind {
+    /// The match (plus `offset`) is the target.
+    Direct,
+    /// The match contains a B or BL at `branch_index` whose target is the target.
+    Xref,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Signature {
+    pub kind: SignatureKind,
+    pub pattern: String,
+    /// Instruction index of the B/BL inside an xref pattern (default 0).
+    #[serde(default)]
+    pub branch_index: Option<usize>,
+    /// Byte offset from a direct match to the target (default 0).
+    #[serde(default)]
+    pub offset: Option<i64>,
+    /// Pick one of several matches instead of requiring exactly one.
+    #[serde(default)]
+    pub match_index: Option<usize>,
+}
+
+/// A build-specific address, trusted only for the version it was taken from.
+#[derive(Clone, Debug, Deserialize)]
+pub struct VersionedRva {
+    pub rva: u64,
+    pub version: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -704,6 +745,61 @@ fn unique<T: std::hash::Hash + Eq + Copy>(
     for v in values {
         if !set.insert(v) {
             return Err(IaotError::Manifest(format!("duplicate {what} index")));
+        }
+    }
+    Ok(())
+}
+fn validate_signatures(
+    name: &str,
+    signatures: &[Signature],
+    fallback: Option<&VersionedRva>,
+) -> Result<(), IaotError> {
+    let invalid = |detail: String| Err(IaotError::Manifest(format!("patch {name} {detail}")));
+    if signatures.is_empty() {
+        return invalid("needs at least one signature".into());
+    }
+    for (index, signature) in signatures.iter().enumerate() {
+        let number = index + 1;
+        let Ok(parsed) = crate::pattern::parse(&signature.pattern) else {
+            return invalid(format!("signature {number} has an invalid pattern"));
+        };
+        if parsed.len() != 1 || parsed[0].0.len() % 4 != 0 {
+            return invalid(format!(
+                "signature {number} must be one alternative of whole instructions"
+            ));
+        }
+        match signature.kind {
+            SignatureKind::Direct => {
+                if signature.branch_index.is_some() {
+                    return invalid(format!("signature {number} is direct but sets branch_index"));
+                }
+                if signature.offset.is_some_and(|offset| offset % 4 != 0) {
+                    return invalid(format!("signature {number} offset is unaligned"));
+                }
+            }
+            SignatureKind::Xref => {
+                if signature.offset.is_some() {
+                    return invalid(format!("signature {number} is an xref but sets offset"));
+                }
+                let branch = signature.branch_index.unwrap_or(0);
+                // The top byte of a B (0x14-0x17) or BL (0x94-0x97), or a wildcard.
+                let top = parsed[0].0.get(branch * 4 + 3).copied();
+                let is_branch = matches!(top, Some(None))
+                    || matches!(top, Some(Some(byte)) if byte & 0x7c == 0x14);
+                if !is_branch {
+                    return invalid(format!(
+                        "signature {number} has no B/BL at instruction {branch}"
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(fallback) = fallback {
+        if fallback.rva % 4 != 0 {
+            return invalid("fallback rva is unaligned".into());
+        }
+        if fallback.version.trim().is_empty() {
+            return invalid("fallback needs the version its rva was taken from".into());
         }
     }
     Ok(())
@@ -1072,6 +1168,10 @@ pub fn validate(m: &Manifest) -> Result<(), IaotError> {
                     patch.name
                 )))
             }
+            Locator::Signatures {
+                signatures,
+                fallback,
+            } => validate_signatures(&patch.name, signatures, fallback.as_ref())?,
             Locator::Symbol { symbol } | Locator::Export { symbol } if symbol.is_empty() => {
                 return Err(IaotError::Manifest(format!(
                     "patch {} has an empty symbol",
@@ -1183,12 +1283,11 @@ pub fn validate(m: &Manifest) -> Result<(), IaotError> {
             let parsed = crate::pattern::parse(expect).map_err(|_| {
                 IaotError::Manifest(format!("patch {} has invalid expected bytes", patch.name))
             })?;
-            if parsed.len() != 1
-                || parsed[0].0.iter().any(|x| x.is_none())
-                || parsed[0].0.len() != 4
-            {
+            // Wildcards let one expectation hold across game versions, e.g.
+            // "FF ?? ?? D1" for any `sub sp, sp, #imm`.
+            if parsed.len() != 1 || parsed[0].0.len() != 4 {
                 return Err(IaotError::Manifest(format!(
-                    "patch {} expect must be exactly four concrete bytes",
+                    "patch {} expect must be exactly four bytes or wildcards",
                     patch.name
                 )));
             }
@@ -1304,6 +1403,64 @@ mod tests {
             },
         ];
         assert!(validate(&m).is_err());
+    }
+    fn signatures_patch(locator: &str) -> Manifest {
+        let mut m = parse("").unwrap();
+        m.patches.push(
+            serde_yaml::from_str(&format!(
+                "name: SignedHook\n\
+                 enabled: true\n\
+                 description: owned signatures fixture\n\
+                 replacement: IAOT_SignedHook\n\
+                 signature: 'int(void*)'\n\
+                 preserve_original: true\n\
+                 locator: {locator}\n\
+                 patch: {{ type: branch_to_cave }}\n\
+                 expect: 'FF ?? ?? D1'\n"
+            ))
+            .unwrap(),
+        );
+        expand_replacement_shorthand(&mut m).unwrap();
+        m
+    }
+    #[test]
+    fn signatures_locator_parses_and_validates() {
+        let m = signatures_patch(
+            "{ type: signatures, signatures: [\
+               { kind: xref, pattern: '?? ?? ?? 94 E0 03 13 AA' },\
+               { kind: xref, pattern: '00 00 80 D2 ?? ?? ?? 17', branch_index: 1 },\
+               { kind: direct, pattern: 'FF ?? ?? D1 ?? ?? ?? A9', offset: 8 }],\
+             fallback: { rva: 0x265CE40, version: '56.3' } }",
+        );
+        validate(&m).unwrap();
+        let Locator::Signatures {
+            signatures,
+            fallback,
+        } = &m.patches[0].locator
+        else {
+            panic!("expected a signatures locator")
+        };
+        assert_eq!(signatures.len(), 3);
+        assert_eq!(signatures[1].branch_index, Some(1));
+        assert_eq!(signatures[2].offset, Some(8));
+        assert_eq!(fallback.as_ref().unwrap().rva, 0x265CE40);
+    }
+    #[test]
+    fn signatures_locator_rejects_bad_shapes() {
+        for locator in [
+            "{ type: signatures, signatures: [] }",
+            // No B/BL at the named instruction.
+            "{ type: signatures, signatures: [{ kind: xref, pattern: 'FF 43 00 D1' }] }",
+            "{ type: signatures, signatures: [{ kind: xref, pattern: '?? ?? ?? 94', branch_index: 1 }] }",
+            // Partial instruction, unaligned offset, direct with a branch index.
+            "{ type: signatures, signatures: [{ kind: direct, pattern: 'FF 43 00' }] }",
+            "{ type: signatures, signatures: [{ kind: direct, pattern: 'FF 43 00 D1', offset: 2 }] }",
+            "{ type: signatures, signatures: [{ kind: direct, pattern: 'FF 43 00 D1', branch_index: 0 }] }",
+            // A fallback must say which version its rva belongs to.
+            "{ type: signatures, signatures: [{ kind: direct, pattern: 'FF 43 00 D1' }], fallback: { rva: 0x1000, version: '' } }",
+        ] {
+            assert!(validate(&signatures_patch(locator)).is_err(), "{locator}");
+        }
     }
     #[test]
     fn replacement_shorthand_allocates_and_wires_runtime_slots() {

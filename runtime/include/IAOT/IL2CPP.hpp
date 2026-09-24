@@ -105,6 +105,16 @@ IAOT_EXPORT std::uint64_t GetCapabilities();
 IAOT_EXPORT bool IsReady();
 IAOT_EXPORT const char *GetResolvedModule();
 IAOT_EXPORT void SetMethodPointerAdapter(MethodPointerAdapter adapter);
+// Number of entries in the generated offline class table, regardless of live
+// IL2CPP availability. Zero means the project's Options::offlineMetadata was
+// never wired up (or its class table is genuinely empty) - useful to
+// distinguish that from "this specific class just isn't in the table".
+IAOT_EXPORT std::size_t GetOfflineClassCount();
+// Raw, undecoded-by-anything-else view of one offline class table entry, for
+// diagnosing whether the generated table's strings actually decrypt to what
+// the project source expects. False if index is out of range.
+IAOT_EXPORT bool GetOfflineClassAt(std::size_t index, const char **module,
+                                   const char **namespc, const char **name);
 
 IAOT_EXPORT const Il2CppAssembly *FindAssembly(const char *assemblyOrImageName);
 IAOT_EXPORT const Il2CppImage *FindImage(const char *assemblyOrImageName);
@@ -146,12 +156,16 @@ IAOT_EXPORT std::string ToUtf8(const Il2CppString *value);
 // allocation -- as soon as a collection runs. Anything held across more than
 // one native call must be pinned with GC::Pin() first.
 namespace GC {
+// Unity 2022.2+ IL2CPP encodes a GC handle as a pointer-sized value, not the
+// older 32-bit slot index; truncating it makes GetTarget fault.
+using Handle = std::uintptr_t;
+
 // Roots and pins `object` so the collector will neither reclaim it nor move
 // it. Returns a handle to release later with Unpin(), or 0 if pinning is
 // unavailable (in which case the caller cannot safely cache the object).
-IAOT_EXPORT std::uint32_t Pin(Il2CppObject *object);
-IAOT_EXPORT Il2CppObject *GetTarget(std::uint32_t handle);
-IAOT_EXPORT void Unpin(std::uint32_t handle);
+IAOT_EXPORT Handle Pin(Il2CppObject *object);
+IAOT_EXPORT Il2CppObject *GetTarget(Handle handle);
+IAOT_EXPORT void Unpin(Handle handle);
 } // namespace GC
 
 namespace Field {
