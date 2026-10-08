@@ -2,17 +2,18 @@
 
 ## Locators
 
-Supported static locators are `signatures`, `pattern`, `xref`, `va`/`vmaddr`, `rva`, `symbol`, `export`, and `il2cpp`. A `custom` locator is a named extension point but is rejected until an offline adapter implements it; arbitrary code from YAML is never executed.
+Supported static locators are `signatures`, `managed`, `pattern`, `xref`, `va`/`vmaddr`, `rva`, `symbol`, `export`, and `il2cpp`. A `custom` locator is a named extension point but is rejected until an offline adapter implements it; arbitrary code from YAML is never executed.
 
 Patterns use two-digit bytes, `?`/`??` wildcards, and `||` alternatives. They search executable segments by default. `segment`, `section`, `expected_matches`, and `match_index` make intent explicit. Multiple matches without an index fail.
 
-For a version-pinned build, a pattern locator may also declare
-`fallback_rva`. The patcher uses it only when pattern resolution fails (no
-match, an unexpected match count, or an ambiguous match). The resolved RVA is
-still subjected to normal alignment, range, architecture, version, and
-`expect` validation.
+On an IL2CPP app a hook can also name its target by managed class and method
+and have the address resolved from the IPA's own metadata at build time; see
+[Managed-name locator](ManagedLocator.md).
 
-Hardcoded VM addresses and RVAs are version-dependent. Use `versions` and pinned `expect` bytes for build-specific definitions.
+Hardcoded VM addresses and RVAs are version-dependent and break on every app
+update. Prefer `signatures`. The old `fallback`/`fallback_rva` pinned addresses
+are no longer supported; manifests that still contain them build with a warning
+and the key is ignored.
 
 ### Signatures
 
@@ -28,11 +29,11 @@ executable segments (or pick one with `match_index`):
 
 Every signature that resolves must name the same address; if two disagree the
 patch fails instead of guessing. Signatures that do not resolve are reported but
-do not fail the patch while another one resolves. `fallback` is a pinned address
-used only when no signature resolves and the detected app/Unity version is the
-one it names (`patch-macho` takes `--app-version`; the pipeline uses the
-analyzed IPA's versions). Do not combine it with `versions`, which rejects the
-build outright on any other version.
+do not fail the patch while another one resolves. If none resolves, the patch
+fails with each signature's reason, so an update that changed the function is
+reported by name instead of patched at a guessed address. Give each patch two
+or more independent signatures (a direct one and an xref from a caller) so one
+compiler change does not lose it.
 
 ```yaml
     locator:
@@ -40,7 +41,6 @@ build outright on any other version.
       signatures:
         - { kind: xref, pattern: "? ? ? 94 ? ? ? 11 ? ? ? B9 ? ? ? 17" }
         - { kind: direct, pattern: "? ? ? 71 ? ? ? 52 ? ? ? 52 28 01 88 9A" }
-      fallback: { rva: 0x265CE40, version: "56.3" }
     expect: "?? ?? ?? 71"
 ```
 
@@ -48,6 +48,20 @@ build outright on any other version.
 example `FF ?? ?? D1` for `sub sp, sp, #imm`) rather than exact bytes that change
 with frame size. Keep register fields exact when an action depends on them. The
 patch report prints how each patch was located.
+
+### Managed names
+
+```yaml
+    locator:
+      type: managed
+      method: "Ns.ClassName::MethodName(System.Int32, System.String)"
+```
+
+A `signatures` locator can carry the same name as `managed:` with
+`use_managed: true`, which makes the name authoritative and turns the patterns
+into a cross-check that reports stale signatures. Grammar, generic
+instantiations, conflict policy, and the error messages are in
+[Managed-name locator](ManagedLocator.md).
 
 ## Replacement with callable original
 

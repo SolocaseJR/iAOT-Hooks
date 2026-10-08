@@ -2,8 +2,10 @@
 
 IAOT is a reusable C++17/Objective-C++ and Rust framework for offline instrumentation of decrypted iOS applications that you own or are authorized to modify. It targets jailed, no-JIT ARM64 deployments: hook callbacks, trampolines, and the runtime dylib are compiled before the final app is signed.
 
-In simple words: iAOT is a framework created to relatively easily apply hooks and menu overlays to iOS apps, even if they're jailed. 
-I made it because I found virtually nothing anywhere on how to make toggle-able mods and working hooks for Jailed, no-JIT iOS apps.
+In simple words: iAOT is a framework for applying hooks and menu overlays to
+iOS apps on jailed (non-jailbroken) devices. I made it because I found
+virtually nothing explaining how to build toggleable mods and working hooks
+for jailed, no-JIT iOS apps.
 
 IAOT does not decrypt IPAs, bypass DRM, obtain signing identities, attach to installed processes, or install unsigned runtime code. See [Responsible Use](RESPONSIBLE_USE.md).
 
@@ -14,11 +16,14 @@ IAOT does not decrypt IPAs, bypass DRM, obtain signing identities, attach to ins
 - Evidence-based Unity IL2CPP, Unity Mono, Swift, Objective-C, Objective-C++, C++, mixed-native, and uncertain-native classification.
 - Unity version and standard `global-metadata.dat` version detection where present.
 - Metal, OpenGL ES, UIKit, Unity, SceneKit, and SpriteKit evidence reporting.
-- Pattern, VA, VM address, RVA, symbol/export, xref, and offline IL2CPP method-manifest locators.
+- Build-time IL2CPP managed-name locators that read the input IPA's own
+  metadata, with signatures available as stale-pattern cross-checks.
+- Cross-version signature/pattern and xref locators, plus symbol/export and
+  explicit VA/RVA locators for native and instruction-level targets.
 - Conservative ARM64 static redirects with callable originals for supported one-instruction entry bridges.
 - Relocation of B/BL, B.cond, CBZ/CBNZ, TBZ/TBNZ, ADR, ADRP, and integer literal loads.
 - Runtime flags, callbacks, original trampolines, isolated hook status, Objective-C method replacement, persistence, structured log levels, and a minimal ImGui Metal overlay.
-- Optional IL2CPP exported-API resolution for metadata lookup, strings, fields, properties, managed invocation, and internal calls.
+- IL2CPP access by name at runtime: classes, overload-exact methods, fields (including on generic bases), native method pointers, strings, managed invocation, and internal calls. No dump, no addresses, nothing to regenerate per game version.
 - Multi-module patching, dylib embedding, `LC_LOAD_DYLIB` injection, IPA repackaging, reopen validation, and YAML reports through one command.
 - A Windows entry point that accepts a project `hooks.yaml`, reads its split
   configuration, builds the dylib in WSL/Theos, and runs the complete pipeline.
@@ -31,7 +36,7 @@ IAOT does not decrypt IPAs, bypass DRM, obtain signing identities, attach to ins
 - The header must have enough existing load-command padding. IAOT does not shift all sections to manufacture space.
 - Typed originals support non-variadic AAPCS64 functions whose exact ABI is supplied by the user. A manifest string cannot prove a C++ ABI, structure-return convention, or proprietary object layout.
 - Runtime-installed native/IL2CPP hooks are intentionally absent. They are unnecessary for the no-JIT design and are not reliable enough to be the framework default.
-- The runtime IL2CPP resolver prefers exported `il2cpp_*` APIs and can use audited offline metadata/address bindings when those exports are stripped. Unmapped capabilities still degrade independently; native and Objective-C hooks remain usable.
+- The runtime IL2CPP resolver uses the game's exported `il2cpp_*` API. A player that strips those exports gets no managed lookups (native and Objective-C hooks remain usable); capabilities degrade independently.
 - IAOT removes stale code-signature commands from patched images but does not sign. The final app, frameworks, and dylib must be signed externally.
 
 ## Repository layout
@@ -65,8 +70,8 @@ The only normal source files to edit are:
   patches; callback/trampoline slots are allocated automatically.
 - `MyHooks/configs.yaml`: project identity, paths, output name, build settings,
   app selection/branding, and general analysis settings.
-- `MyHooks/il2cpp_config.yaml`: optional IL2CPP-only metadata imports, string
-  factory, and offline resolver bindings.
+- `MyHooks/il2cpp_config.yaml`: optional IL2CPP analysis settings (backend and
+  module). No dump or address table is needed.
 - `MyHooks/user/UserHooks.mm`: typed callbacks.
 - `MyHooks/user/UserMenu.mm`: the minimal ImGui menu.
 - `MyHooks/user/UserFeatures.hpp`: shared toggle helpers.
@@ -216,31 +221,61 @@ site. Set `instruction_offset` to a signed byte offset when a nearby branch
 encodes the desired destination, for example
 `{ type: branch_to_instruction_target, instruction_offset: -12 }`.
 
+## Updating to a new app version
+
+IAOT is built so an update is a path change, not a research project:
+
+1. Decrypt the new version yourself.
+2. Change `paths.input_ipa` in `configs.yaml`. It is the only input and is
+   defined only there.
+3. Build. A `managed` locator resolves the method from the new IPA. A
+   `signatures` locator with `managed:` and `use_managed: true` uses that name
+   as the target and reports which byte signatures became stale. Native and
+   instruction-level signature-only hooks must still match the updated code.
+   `hook-preflight.yaml` records how every patch was found.
+4. Managed classes, methods and fields used from callbacks are looked up by
+   name at runtime, so they need no generated address table. A renamed member
+   resolves to null and is logged instead of calling a stale address.
+
+Nothing in this workflow reads a Cpp2IL/Il2CppDumper dump or a hardcoded
+address from a previous version. Use those tools to research new hooks; encode
+IL2CPP method-entry hooks as managed names, optionally retain signatures as
+cross-checks, and use signature-only locators for native or internal
+instruction sites. Build-time managed lookup currently supports metadata
+version 39; unsupported or encrypted metadata fails with an actionable error
+and can fall back to supplied signatures.
+
 ## Static hooks versus runtime IL2CPP
 
-Static hooks are resolved offline and written before signing. They never wait for IL2CPP initialization. For IL2CPP name-based static hooks, import an audited method map and use `locator.type: il2cpp`; see [IL2CPP](docs/IL2CPP.md).
+Static hooks are resolved offline and written before signing. They never wait
+for IL2CPP initialization. On a supported IL2CPP app, prefer a managed name for
+a method-entry hook and optionally retain signatures as cross-checks. Use
+signature locators for native functions and instruction sites inside a method.
+See [Hooks](docs/Hooks.md) and [Managed-name locator](docs/ManagedLocator.md).
 
-For stripped IL2CPP builds, enable the IL2CPP file from `configs.yaml`, then
-point `runtime.metadata_package` in `il2cpp_config.yaml` at an offline dump.
-Name-only bindings are resolved to native RVAs/offsets at build time. Both
-Cpp2IL and Il2CppDumper formats are auto-detected. See [IL2CPP: offline metadata
-dumps](docs/IL2CPP.md#offline-metadata-dumps-build-time-name-resolution).
-
-The runtime resolver is additional functionality used inside an already-installed callback:
+The runtime IL2CPP resolver is used inside an already-installed callback and
+finds everything by name:
 
 ```cpp
-std::string current = iaot::il2cpp::String::ToUtf8(originalName);
-auto* replacement = iaot::il2cpp::String::New("Example Name");
+using namespace iaot::il2cpp;
+auto* klass = FindClass("Example.Game", "Player");          // any assembly
+auto* method = FindMethod(klass, "SetName", {"System.String"});
+auto call = reinterpret_cast<void (*)(Il2CppObject*, Il2CppString*, const MethodInfo*)>(
+    NativeMethodPointer(method));
+call(player, String::New("Example Name"), method);
 ```
 
-It also supports class/method/field/property lookup and `runtime_invoke` when the required exports exist. Resolver failure does not disable static native hooks, Objective-C hooks, persistence, or the overlay.
+It also supports fields (including fields of generic base classes through
+`FindObjectField`), properties, arrays, and `runtime_invoke`. Resolver failure
+does not disable static native hooks, Objective-C hooks, persistence, or the
+overlay. See [IL2CPP](docs/IL2CPP.md).
 
 ## Reports
 
 Generated artifacts are separate from user code:
 
 - `ipa-analysis.yaml` and `.txt`
-- `il2cpp-methods.yaml` skeleton when IL2CPP is detected
+- `il2cpp-methods.yaml` skeleton when IL2CPP is detected (only for the optional pinned `il2cpp` locator)
 - `generated/hook-manifest.yaml`
 - `IAOTGeneratedConfig.hpp`, `Functions.hpp`, `Originals.hpp`, `Project.hpp`, and `Hooks.mm`
 - `IAOTGeneratedProject.mk` and `hook-preflight.yaml`
@@ -256,7 +291,7 @@ cargo clippy --manifest-path patcher/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path patcher/Cargo.toml --locked
 cmake -S . -B build-portable
 cmake --build build-portable
-ctest --test-dir build-portable --output-on-failure
+ctest --test-dir build-portable -C Debug --output-on-failure
 ```
 
 The Rust suite includes a synthetic complete IPA-to-IPA pipeline. A real decrypted IPA and iOS signing identity cannot be distributed as a test fixture, so device launch/signing remains a documented manual validation step.

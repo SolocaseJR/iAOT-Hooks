@@ -14,6 +14,7 @@ extern "C" void IAOT_MockSendDiagnosticInfo(void*, const void*);
 extern "C" bool IAOT_InstallMockUserHooks(const iaot::HookContext& ctx);
 namespace iaot { void RegisterGeneratedHooks() {
     SetLogLevel(LogLevel::Info);
+    Log(OBF("[IAOTProfile] configured staticPatches=7 objectiveC=0 installers=1 callbackSlots=7; configuration counts, not execution evidence"));
     il2cpp::MarkNotApplicable();
     RegisterHook({ OBF("GeneratedCallbacks"), +[](const HookContext&) -> bool {
         IAOTSetCallback(IAOTCallback::MockAnoSDKGetReportData, reinterpret_cast<std::uintptr_t>(&IAOT_MockAnoSDKGetReportData));

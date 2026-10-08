@@ -23,7 +23,7 @@ hooks:
   failure_behavior: disable_hook
 - name: MockAnoSDKGetReportData4
   enabled: true
-  module: Payload/MockTelemetry.app/Frameworks/MockAnoSDK.framework/MockAnoSDK
+  module: anogs
   signature: std::int64_t(int)
   original_slot: null
   failure_behavior: disable_hook
@@ -46,3 +46,7 @@ hooks:
   original_slot: 1
   failure_behavior: disable_hook
 objective_c_hooks: []
+generated_hooks:
+- name: MockUserHooks
+  enabled: true
+  symbol: IAOT_InstallMockUserHooks

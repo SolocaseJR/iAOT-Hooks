@@ -18,13 +18,13 @@ enum class IAOTCallback : std::uint32_t {
     MockSendDiagnosticInfo = 6,
 };
 inline constexpr bool IAOTDefaultFlag_disable_mock_transport = true;
-inline const char* IAOTCallbackSymbol_MockAnoSDKGetReportData = OBF("IAOT_MockAnoSDKGetReportData");
-inline const char* IAOTCallbackSymbol_MockAnoSDKGetReportData2 = OBF("IAOT_MockAnoSDKGetReportData2");
-inline const char* IAOTCallbackSymbol_MockAnoSDKGetReportData3 = OBF("IAOT_MockAnoSDKGetReportData3");
-inline const char* IAOTCallbackSymbol_MockAnoSDKGetReportData4 = OBF("IAOT_MockAnoSDKGetReportData4");
-inline const char* IAOTCallbackSymbol_MockEnableGameReport = OBF("IAOT_MockEnableGameReport");
-inline const char* IAOTCallbackSymbol_MockSendDataToServer = OBF("IAOT_MockSendDataToServer");
-inline const char* IAOTCallbackSymbol_MockSendDiagnosticInfo = OBF("IAOT_MockSendDiagnosticInfo");
+[[maybe_unused]] static const char* IAOTCallbackSymbol_MockAnoSDKGetReportData = OBF("IAOT_MockAnoSDKGetReportData");
+[[maybe_unused]] static const char* IAOTCallbackSymbol_MockAnoSDKGetReportData2 = OBF("IAOT_MockAnoSDKGetReportData2");
+[[maybe_unused]] static const char* IAOTCallbackSymbol_MockAnoSDKGetReportData3 = OBF("IAOT_MockAnoSDKGetReportData3");
+[[maybe_unused]] static const char* IAOTCallbackSymbol_MockAnoSDKGetReportData4 = OBF("IAOT_MockAnoSDKGetReportData4");
+[[maybe_unused]] static const char* IAOTCallbackSymbol_MockEnableGameReport = OBF("IAOT_MockEnableGameReport");
+[[maybe_unused]] static const char* IAOTCallbackSymbol_MockSendDataToServer = OBF("IAOT_MockSendDataToServer");
+[[maybe_unused]] static const char* IAOTCallbackSymbol_MockSendDiagnosticInfo = OBF("IAOT_MockSendDiagnosticInfo");
 inline bool IAOTGetFlag(IAOTFlag v){return iaot::GetBool(static_cast<std::uint32_t>(v));}
 inline void IAOTSetFlag(IAOTFlag v,bool x){iaot::SetBool(static_cast<std::uint32_t>(v),x);}
 inline const char* IAOTGetString(IAOTString v){return iaot::GetString(static_cast<std::uint32_t>(v));}

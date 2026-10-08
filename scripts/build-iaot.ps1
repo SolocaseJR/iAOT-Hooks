@@ -95,6 +95,11 @@ if ($LASTEXITCODE -ne 0) { throw "[wsl] $Distro could not start; run 'wsl --shut
 
 function Convert-ToWsl([string]$Path) {
     $fullPath = [IO.Path]::GetFullPath($Path)
+    # Drive paths map directly to the DrvFs mount. Going through wsl.exe would
+    # re-split an argument containing spaces, truncating "iOS Mods" to "iOS".
+    if ($fullPath -match '^([A-Za-z]):') {
+        return '/mnt/' + $Matches[1].ToLowerInvariant() + $fullPath.Substring(2).Replace([string][char]92, [string][char]47)
+    }
     $variableName = 'IAOT_WINDOWS_PATH'
     $oldValue = [Environment]::GetEnvironmentVariable($variableName, 'Process')
     $oldWslEnv = $env:WSLENV
@@ -103,7 +108,7 @@ function Convert-ToWsl([string]$Path) {
         # WSLENV /p asks wsl.exe itself to translate the Windows path. This
         # avoids shell parsing of spaces, backslashes, ampersands, parentheses,
         # and quotes in project paths.
-        Set-Item -LiteralPath "Env:$variableName" -Value $fullPath
+        Set-Item -LiteralPath "Env:$variableName" -Value $fullPath.Replace([string][char]92, [string][char]47)
 
         $entries = @()
         if ($oldWslEnv) {
@@ -111,10 +116,10 @@ function Convert-ToWsl([string]$Path) {
                 $_ -and $_ -notmatch '^IAOT_WINDOWS_PATH(?:/.*)?$'
             })
         }
-        $env:WSLENV = (@($entries) + "$variableName/p") -join ':'
+        $env:WSLENV = (@($entries) + "$variableName") -join ':'
 
         $mappedOutput = @(
-            & wsl.exe -d $Distro -- bash -lc 'printf "%s" "$IAOT_WINDOWS_PATH"'
+            & wsl.exe -d $Distro -- bash -lc 'IFS=; wslpath -a -u $IAOT_WINDOWS_PATH'
         )
         $exitCode = $LASTEXITCODE
         $mapped = ($mappedOutput -join "`n").Trim()

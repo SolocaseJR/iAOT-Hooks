@@ -7,6 +7,7 @@
 extern "C" bool IAOT_InstallUserHooks(const iaot::HookContext& ctx);
 namespace iaot { void RegisterGeneratedHooks() {
     SetLogLevel(LogLevel::Info);
-    RegisterHook({ OBF("IL2CPPRuntimeResolver"), +[](const HookContext&) -> bool { il2cpp::Options options; options.moduleName = *IAOT_IL2CPP_MODULE ? IAOT_IL2CPP_MODULE : nullptr; options.stringFactoryRva = IAOT_IL2CPP_STRING_FACTORY_RVA; options.offlineMetadata = &IAOTOfflineMetadata; return il2cpp::InitializeAsync(options); } });
+    Log(OBF("[IAOTProfile] configured staticPatches=0 objectiveC=0 installers=1 callbackSlots=0; configuration counts, not execution evidence"));
+    RegisterHook({ OBF("IL2CPPRuntimeResolver"), +[](const HookContext&) -> bool { il2cpp::Options options; options.moduleName = *IAOT_IL2CPP_MODULE ? IAOT_IL2CPP_MODULE : nullptr; return il2cpp::InitializeAsync(options); } });
     RegisterHook({ OBF("UserHooks"), IAOT_InstallUserHooks });
 } }

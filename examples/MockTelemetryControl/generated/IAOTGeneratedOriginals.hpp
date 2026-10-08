@@ -2,6 +2,11 @@
 #pragma once
 #include <IAOT/IAOT.hpp>
 namespace iaot::generated {
+inline auto Original_MockAnoSDKGetReportData(){return iaot::AppFunction<std::int64_t(int)>::FromRuntime(0);}
+inline auto Original_MockAnoSDKGetReportData2(){return iaot::AppFunction<std::int64_t(int)>::FromRuntime(0);}
+inline auto Original_MockAnoSDKGetReportData3(){return iaot::AppFunction<std::int64_t(int)>::FromRuntime(0);}
+inline auto Original_MockAnoSDKGetReportData4(){return iaot::AppFunction<std::int64_t(int)>::FromRuntime(0);}
+inline auto Original_MockEnableGameReport(){return iaot::AppFunction<void(const void*)>::FromRuntime(0);}
 inline auto Original_MockSendDataToServer(){return iaot::OriginalFunction<void(void*, const void*)>(0);}
 inline auto Original_MockSendDiagnosticInfo(){return iaot::OriginalFunction<void(void*, const void*)>(1);}
 }

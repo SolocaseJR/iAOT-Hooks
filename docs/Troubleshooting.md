@@ -15,6 +15,18 @@
 - **Relocation unsupported:** move to a safe entry instruction or add/test a relocation implementation. SIMD/FP literals and PRFM currently fail closed.
 - **Branch out of range:** the appended cave is outside the ARM64 immediate range. This layout needs a reviewed near-island strategy not currently implemented.
 - **Not enough load-command padding:** IAOT will not shift all existing sections. Use a compatible build/layout or extend the writer with full offset rewriting and tests.
+- **Managed name is ambiguous:** the error lists the overloads or the
+  assemblies. Add the parameter types to the `method:` string, or add
+  `assembly:`. See [Managed-name locator](ManagedLocator.md).
+- **Managed name has no native body:** the method is abstract, extern, or was
+  stripped, or the generic instantiation you asked for was never compiled (the
+  error lists the ones that were). Hook a concrete implementation, or fall back
+  to signatures.
+- **Unsupported metadata version:** only `global-metadata.dat` v39 is read, and
+  encrypted metadata cannot be read at all. Use signatures for that build.
+- **Managed name and signatures disagree:** the patch stops rather than guess.
+  Confirm which address is right, then either refresh the stale pattern or set
+  `on_conflict: prefer_managed`.
 - **Hook disabled safely:** inspect `hook-preflight.yaml` or `final-validation.yaml`; `failure_behavior: disable_hook` preserves the rest of the build.
 
 ## WSL and Theos
@@ -33,5 +45,6 @@
 - **Invalid load commands:** keep the failed report/work directory and run `iaot inspect-macho`/`verify`; do not sign the IPA.
 - **App crashes before logs:** common causes are invalid signing, wrong callback ABI, arm64e/PAC assumptions, or an incorrect target. Start with all patches disabled.
 - **Original call returns a default:** the original slot is zero/unavailable. Confirm `original_vmaddr` in the report and that the callback signature/name matches generated code.
-- **IL2CPP unavailable:** stripped exports are common. Static hooks still work; use an offline method map and treat runtime APIs as optional.
+- **IL2CPP unavailable:** the runtime resolver needs the game's `il2cpp_*` exports. If the status stays `runtime_functions_unavailable`, the exports are stripped; static hooks still work, and managed lookups return null.
+- **A managed member returns null after an update:** the class, method or field was renamed or its overload changed. The log names ambiguous overloads; pass parameter types to `FindMethod`.
 - **Install rejected:** sign the main executable and every nested framework/dylib with compatible entitlements/provisioning. IAOT does not perform this step.

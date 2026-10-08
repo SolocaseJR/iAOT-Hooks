@@ -4,7 +4,7 @@ mod branding;
 mod caves;
 mod errors;
 mod generate;
-mod il2cpp_metadata;
+mod il2cpp_name;
 mod ipa;
 mod macho;
 mod manifest;
@@ -82,9 +82,9 @@ enum Cmd {
         output: PathBuf,
         #[arg(long)]
         load_dylib: bool,
-        /// App/Unity version of the input, enabling version-pinned fallbacks.
-        #[arg(long = "app-version")]
-        app_versions: Vec<String>,
+        /// global-metadata.dat from the same app, for `managed` locators.
+        #[arg(long)]
+        metadata: Option<PathBuf>,
     },
     PatchIpa {
         #[arg(long)]
@@ -117,6 +117,7 @@ enum Cmd {
 }
 fn validated(path: &Path) -> anyhow::Result<manifest::Manifest> {
     let m = manifest::load(path)?;
+    manifest::report_warnings(&m);
     manifest::validate(&m)?;
     Ok(m)
 }
@@ -345,7 +346,7 @@ fn main() -> anyhow::Result<()> {
             input,
             output,
             load_dylib,
-            app_versions,
+            metadata,
         } => {
             let m = validated(&manifest)?;
             let report = macho::patch_with_options(
@@ -354,7 +355,7 @@ fn main() -> anyhow::Result<()> {
                 &output,
                 macho::PatchOptions {
                     load_dylib,
-                    app_versions,
+                    metadata,
                 },
             )?;
             print_patch_report(&report);
@@ -385,13 +386,26 @@ fn main() -> anyhow::Result<()> {
             let patched = temp.path().join("patched-macho");
             ipa::extract_member(&input, &executable_member, &original)?;
             println!("target member: {executable_member}");
+            // A `managed` locator reads names from the app's own metadata, so
+            // take it from the IPA being patched rather than asking for a path.
+            let metadata_member = analyzer::analyze_ipa(&input)
+                .ok()
+                .and_then(|analysis| analysis.unity.metadata_member);
+            let metadata = match &metadata_member {
+                Some(member) => {
+                    let path = temp.path().join("global-metadata.dat");
+                    ipa::extract_member(&input, member, &path)?;
+                    Some(path)
+                }
+                None => None,
+            };
             let report = macho::patch_with_options(
                 &m,
                 &original,
                 &patched,
                 macho::PatchOptions {
                     load_dylib: dylib.is_some(),
-                    ..Default::default()
+                    metadata,
                 },
             )?;
             let addition = if let Some(path) = dylib.as_deref() {

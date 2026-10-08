@@ -2,5 +2,5 @@
 #pragma once
 #include <IAOT/IAOT.hpp>
 namespace iaot::generated {
-inline auto Original_ExampleHook(){return iaot::OriginalFunction<int(void*, int)>(0);}
+inline auto Original_ExampleHook(){return iaot::AppFunction<int(void*, int)>::FromRuntime(0);}
 }

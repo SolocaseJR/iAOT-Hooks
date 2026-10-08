@@ -58,6 +58,90 @@ fn read_plist(path: &Path) -> anyhow::Result<Value> {
         .with_context(|| format!("cannot parse property list {}", path.display()))
 }
 
+/// `.strings` files are usually the legacy text format (`"key" = "value";`
+/// with C-style comments) rather than a plist; accept both.
+fn read_strings_file(path: &Path) -> anyhow::Result<Value> {
+    let bytes = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    if let Ok(value) = Value::from_reader(Cursor::new(&bytes)) {
+        return Ok(value);
+    }
+    let text = if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        let le = bytes[0] == 0xFF;
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| {
+                if le {
+                    u16::from_le_bytes([c[0], c[1]])
+                } else {
+                    u16::from_be_bytes([c[0], c[1]])
+                }
+            })
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(&bytes)
+            .trim_start_matches('\u{feff}')
+            .to_owned()
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    let mut tokens: Vec<String> = Vec::new();
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i += 2;
+        } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '"' {
+            i += 1;
+            let mut out = String::new();
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 1;
+                    out.push(match chars[i] {
+                        'n' => '\n',
+                        't' => '\t',
+                        other => other,
+                    });
+                } else {
+                    out.push(chars[i]);
+                }
+                i += 1;
+            }
+            i += 1;
+            tokens.push(out);
+        } else if c.is_whitespace() || c == '=' || c == ';' {
+            i += 1;
+        } else {
+            // unquoted key or value
+            let start = i;
+            while i < chars.len()
+                && !chars[i].is_whitespace()
+                && !matches!(chars[i], '=' | ';' | '"')
+            {
+                i += 1;
+            }
+            tokens.push(chars[start..i].iter().collect());
+        }
+    }
+    anyhow::ensure!(
+        tokens.len().is_multiple_of(2),
+        "malformed .strings file {}",
+        path.display()
+    );
+    let mut dict = Dictionary::new();
+    for pair in tokens.chunks(2) {
+        dict.insert(pair[0].clone(), Value::String(pair[1].clone()));
+    }
+    Ok(Value::Dictionary(dict))
+}
+
 fn write_binary_plist(value: &Value, path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -172,7 +256,7 @@ fn add_localized_names(
         if !source.is_file() {
             continue;
         }
-        let mut value = read_plist(&source)?;
+        let mut value = read_strings_file(&source)?;
         dictionary(&mut value)?.insert(
             "CFBundleDisplayName".into(),
             Value::String(display_name.into()),
@@ -282,15 +366,24 @@ mod tests {
             let source = dir.path().join("input");
             fs::create_dir_all(&source).unwrap();
             let mut root = Dictionary::new();
-            root.insert("UISupportedDevices".into(), Value::Array(vec![Value::String("iPad1,1".into())]));
-            root.insert("UIDeviceFamily".into(), Value::Array(vec![Value::Integer(1.into()), Value::Integer(2.into())]));
+            root.insert(
+                "UISupportedDevices".into(),
+                Value::Array(vec![Value::String("iPad1,1".into())]),
+            );
+            root.insert(
+                "UIDeviceFamily".into(),
+                Value::Array(vec![Value::Integer(1.into()), Value::Integer(2.into())]),
+            );
             write_binary_plist(&Value::Dictionary(root), &source.join("Info.plist")).unwrap();
-            let option = enabled.map(|v| format!("remove_supported_devices: {v}")).unwrap_or_default();
+            let option = enabled
+                .map(|v| format!("remove_supported_devices: {v}"))
+                .unwrap_or_default();
             let manifest: Manifest = serde_yaml::from_str(&format!(
                 "project: {{ name: Test, bundle_id: test, platform: ios, arch: arm64, min_ios: '14.0' }}\nruntime: {{ config_segment: __CFG, cave_segment: __CAVE, page_size: 16384, dylib_name: Test.dylib }}\napp: {{ {option} }}\n"
             )).unwrap();
             let out = dir.path().join("out");
-            let artifacts = prepare(&manifest, "Payload/Test.app", "Info.plist", &source, &out).unwrap();
+            let artifacts =
+                prepare(&manifest, "Payload/Test.app", "Info.plist", &source, &out).unwrap();
             let plist = if enabled == Some(true) {
                 assert_eq!(artifacts.replacements.len(), 1);
                 read_plist(&out.join("Info.plist")).unwrap()
@@ -299,7 +392,10 @@ mod tests {
                 read_plist(&source.join("Info.plist")).unwrap()
             };
             let dict = plist.as_dictionary().unwrap();
-            assert_eq!(dict.contains_key("UISupportedDevices"), enabled != Some(true));
+            assert_eq!(
+                dict.contains_key("UISupportedDevices"),
+                enabled != Some(true)
+            );
             assert!(dict.contains_key("UIDeviceFamily"));
         }
     }

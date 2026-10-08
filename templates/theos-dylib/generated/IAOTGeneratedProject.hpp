@@ -6,18 +6,4 @@
 #define IAOT_ENABLE_PERSISTENCE 1
 #define IAOT_ENABLE_IL2CPP_RUNTIME 1
 #define IAOT_IL2CPP_MODULE ""
-#define IAOT_IL2CPP_STRING_FACTORY_RVA 0x0ULL
 #define IAOT_RENDERING_BACKEND_AUTO 1
-inline iaot::il2cpp::OfflineClassBinding IAOTOfflineClasses[] = {
-  {},
-};
-inline iaot::il2cpp::OfflineMethodBinding IAOTOfflineMethods[] = {
-  {},
-};
-inline iaot::il2cpp::OfflineFieldBinding IAOTOfflineFields[] = {
-  {},
-};
-inline iaot::il2cpp::OfflineInternalCallBinding IAOTOfflineInternalCalls[] = {
-  {},
-};
-inline iaot::il2cpp::OfflineMetadata IAOTOfflineMetadata{IAOTOfflineClasses, 0, IAOTOfflineMethods, 0, IAOTOfflineFields, 0, IAOTOfflineInternalCalls, 0};

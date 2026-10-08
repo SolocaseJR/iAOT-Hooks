@@ -14,26 +14,36 @@ const Il2CppImage *FindImage(const char *) { return nullptr; }
 Il2CppClass *FindClass(const char *, const char *, const char *) {
   return nullptr;
 }
+Il2CppClass *FindClass(const char *, const char *) { return nullptr; }
 Il2CppClass *FindNestedClass(Il2CppClass *, const char *) { return nullptr; }
 Il2CppClass *GetParentClass(Il2CppClass *) { return nullptr; }
+Il2CppClass *ObjectClass(const Il2CppObject *) { return nullptr; }
 const char *ClassName(Il2CppClass *) { return nullptr; }
+const char *ClassNamespace(Il2CppClass *) { return nullptr; }
 const MethodInfo *FindMethod(Il2CppClass *, const char *, int) {
   return nullptr;
 }
+const MethodInfo *FindMethod(Il2CppClass *, const char *,
+                             std::initializer_list<const char *>) {
+  return nullptr;
+}
 FieldInfo *FindField(Il2CppClass *, const char *) { return nullptr; }
+FieldInfo *FindObjectField(const Il2CppObject *, const char *) {
+  return nullptr;
+}
 const PropertyInfo *FindProperty(Il2CppClass *, const char *) {
   return nullptr;
 }
 std::uintptr_t NativeMethodPointer(const MethodInfo *) { return 0; }
-std::uintptr_t OfflineMethodPointer(const char *, const char *, const char *,
-                                    const char *, int) {
-  return 0;
-}
 Il2CppObject *Invoke(const MethodInfo *, Il2CppObject *, void **,
                      Il2CppException **) {
   return nullptr;
 }
 std::uintptr_t ResolveInternalCall(const char *) { return 0; }
+namespace Array {
+std::size_t ElementSize(const Il2CppObject *) { return 0; }
+Il2CppClass *ElementClass(const Il2CppObject *) { return nullptr; }
+} // namespace Array
 namespace String {
 Il2CppString *New(const char *) { return nullptr; }
 std::string ToUtf8(const Il2CppString *) { return {}; }
@@ -45,6 +55,7 @@ void Unpin(Handle) {}
 } // namespace GC
 namespace Field {
 std::size_t Offset(const FieldInfo *) { return 0; }
+std::size_t ValueOffset(const FieldInfo *) { return 0; }
 bool GetStatic(const FieldInfo *, void *) { return false; }
 bool SetStatic(FieldInfo *, const void *) { return false; }
 bool GetInstance(Il2CppObject *, const FieldInfo *, void *) { return false; }

@@ -8,8 +8,9 @@ New IAOT projects use three focused YAML files.
 - `configs.yaml` contains project identity, paths and final IPA name, build
   settings, general analysis settings, runtime container settings, and app
   targeting.
-- `il2cpp_config.yaml` contains only IL2CPP analysis, metadata imports, string
-  factory, and offline classes/methods/fields/internal calls.
+- `il2cpp_config.yaml` contains only IL2CPP analysis settings (backend, module,
+  optional method map). IL2CPP members are found by name at runtime, so it
+  holds no dump paths or address tables.
 
 `hooks.yaml` selects the project settings:
 
@@ -55,8 +56,8 @@ Legacy monolithic `hooks.yaml` manifests remain supported.
 - `analysis`: application/renderer classification in `configs.yaml`; IL2CPP
   backend/module/analyzer selection in `il2cpp_config.yaml`.
 - `runtime`: cave/config segment names, page size, and dylib name in
-  `configs.yaml`; metadata and offline resolver bindings in
-  `il2cpp_config.yaml`.
+  `configs.yaml`. The former dump keys (`metadata_package`, `offline_*`,
+  `string_factory*`) are ignored with a warning.
 - `app`: executable/target override, Unity-framework preference, and optional
   `display_name`/`icon_path` SpringBoard branding. The icon path is relative to
   the hook project and must reference a square PNG of at least 180x180 pixels
@@ -69,7 +70,10 @@ Legacy monolithic `hooks.yaml` manifests remain supported.
   registered in generated runtime code. This does not disable independently
   registered callbacks, static patches, Objective-C hooks, or dylib constructors.
 - `patches`: replacement symbol, ABI, automatic original preservation, module,
-  failure behavior, constraints, locator, action, and expected bytes.
+  failure behavior, constraints, locator, action, and expected bytes. A
+  locator may be `type: managed`, or `type: signatures` with `managed:` and
+  `use_managed:`, to name an IL2CPP target instead of matching bytes; the
+  grammar and options are in [Managed-name locator](ManagedLocator.md).
 
 Run `iaot validate hooks.yaml`; referenced files are merged before validation.
 Run `iaot resolve-config --manifest hooks.yaml` to print the fully resolved

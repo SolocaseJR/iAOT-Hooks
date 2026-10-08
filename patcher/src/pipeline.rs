@@ -28,6 +28,15 @@ struct HookPatchRecord {
     displaced_bytes: String,
     original_vmaddr: Option<String>,
     located_by: String,
+    /// The generic instantiation that was hooked, when the target is generic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instantiation: Option<String>,
+    /// The entry address before an entry stub was followed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stub_from: Option<String>,
+    /// Cross-check results and anything that degraded, in resolution order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,24 +201,7 @@ fn apply_analysis_overrides(
     report.unity.runtime_resolver = if report.unity.scripting_backend != "il2cpp" {
         "not_applicable".into()
     } else if manifest.analysis.runtime_il2cpp {
-        if manifest.runtime.string_factory_rva.is_some()
-            && (!manifest.runtime.offline_classes.is_empty()
-                || !manifest.runtime.offline_methods.is_empty()
-                || !manifest.runtime.offline_fields.is_empty()
-                || !manifest.runtime.offline_internal_calls.is_empty())
-        {
-            "iaot_exported_api_resolver+offline_metadata+static_utf16_string_factory".into()
-        } else if !manifest.runtime.offline_classes.is_empty()
-            || !manifest.runtime.offline_methods.is_empty()
-            || !manifest.runtime.offline_fields.is_empty()
-            || !manifest.runtime.offline_internal_calls.is_empty()
-        {
-            "iaot_exported_api_resolver+offline_metadata".into()
-        } else if manifest.runtime.string_factory_rva.is_some() {
-            "iaot_exported_api_resolver+static_utf16_string_factory".into()
-        } else {
-            "iaot_exported_api_resolver".into()
-        }
+        "iaot_exported_api_resolver".into()
     } else {
         "disabled".into()
     };
@@ -311,6 +303,12 @@ fn patch_extracted_modules(
         if !source.is_file() {
             anyhow::bail!("selected Mach-O is missing from workspace: {member}")
         }
+        let metadata = analysis
+            .unity
+            .metadata_member
+            .as_ref()
+            .map(|member| extracted.join(Path::new(member)))
+            .filter(|path| path.is_file());
         let mut module_manifest = manifest.clone();
         module_manifest.patches = patches;
         let output = patched_dir.join(format!("module-{index}.macho"));
@@ -320,10 +318,7 @@ fn patch_extracted_modules(
             &output,
             macho::PatchOptions {
                 load_dylib: load_runtime && member == analysis.executable_member,
-                app_versions: detected_versions(analysis)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
+                metadata,
             },
         )
         .map_err(|error| error.context(format!("failed to patch {member}")))?;
@@ -353,7 +348,15 @@ fn patch_extracted_modules(
                     .original_vmaddr
                     .map(|address| format!("0x{address:x}")),
                 located_by: resolution.located_by,
+                instantiation: resolution.instantiation,
+                stub_from: resolution.stub_from.map(|address| format!("0x{address:x}")),
+                notes: resolution.notes,
             });
+        }
+        for record in &applied_hooks {
+            for note in &record.notes {
+                println!("    note ({}): {note}", record.name);
+            }
         }
         for failure in patch_report.failures {
             println!(
@@ -465,6 +468,7 @@ fn report_directory(options: &PipelineOptions<'_>, manifest: &Manifest) -> PathB
 
 pub fn prepare(manifest_path: &Path, input_ipa: &Path, reports: &Path) -> anyhow::Result<()> {
     let manifest = manifest::load(manifest_path)?;
+    manifest::report_warnings(&manifest);
     manifest::validate(&manifest)?;
     let mut analysis = analyzer::analyze_ipa(input_ipa)?;
     apply_analysis_overrides(&mut analysis, &manifest)?;
@@ -525,6 +529,7 @@ pub fn run(options: PipelineOptions<'_>) -> anyhow::Result<()> {
         anyhow::bail!("input and output IPA paths must differ")
     }
     let manifest = manifest::load(options.manifest_path)?;
+    manifest::report_warnings(&manifest);
     manifest::validate(&manifest)?;
     println!(
         "[1/8] Analyzing decrypted IPA: {}",

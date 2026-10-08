@@ -10,10 +10,10 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace iaot::il2cpp {
@@ -35,11 +35,17 @@ struct Api {
   Il2CppClass *(*classGetParent)(Il2CppClass *){};
   const char *(*classGetName)(Il2CppClass *){};
   const char *(*classGetNamespace)(Il2CppClass *){};
+  Il2CppClass *(*classGetElementClass)(Il2CppClass *){};
+  int (*classArrayElementSize)(const Il2CppClass *){};
+  Il2CppClass *(*objectGetClass)(const Il2CppObject *){};
   const MethodInfo *(*classGetMethods)(Il2CppClass *, void **){};
   const MethodInfo *(*classGetMethodFromName)(Il2CppClass *, const char *,
                                               int){};
   const char *(*methodGetName)(const MethodInfo *){};
   std::uint32_t (*methodGetParamCount)(const MethodInfo *){};
+  const Il2CppType *(*methodGetParam)(const MethodInfo *, std::uint32_t){};
+  char *(*typeGetName)(const Il2CppType *){};
+  void (*freeMemory)(void *){};
   FieldInfo *(*classGetFieldFromName)(Il2CppClass *, const char *){};
   const PropertyInfo *(*classGetPropertyFromName)(Il2CppClass *,
                                                   const char *){};
@@ -65,40 +71,15 @@ std::atomic<Status> g_status{Status::NotDetected};
 std::atomic<std::uint64_t> g_capabilities{0};
 std::atomic<MethodPointerAdapter> g_methodPointerAdapter{nullptr};
 std::atomic_bool g_apiPublished{false};
-using StaticStringFactory = Il2CppString *(*)(void *, const std::uint16_t *,
-                                              const MethodInfo *);
-std::atomic<StaticStringFactory> g_staticStringFactory{nullptr};
-std::uintptr_t g_staticStringFactoryRva = 0;
-const OfflineMetadata *g_offlineMetadata = nullptr;
-
-constexpr std::uint64_t kOfflineClassMagic = 0x49414F54434C4153ULL;
-constexpr std::uint64_t kOfflineMethodMagic = 0x49414F544D455448ULL;
-constexpr std::uint64_t kOfflineFieldMagic = 0x49414F544649454CULL;
-struct OfflineClassHandle {
-  std::uint64_t magic{kOfflineClassMagic};
-  const OfflineClassBinding *binding{};
-};
-struct OfflineMethodHandle {
-  std::uint64_t magic{kOfflineMethodMagic};
-  const OfflineMethodBinding *binding{};
-};
-struct OfflineFieldHandle {
-  std::uint64_t magic{kOfflineFieldMagic};
-  const OfflineFieldBinding *binding{};
-};
-std::mutex g_offlineMutex;
-std::vector<std::unique_ptr<OfflineClassHandle>> g_offlineClasses;
-std::vector<std::unique_ptr<OfflineMethodHandle>> g_offlineMethods;
-std::vector<std::unique_ptr<OfflineFieldHandle>> g_offlineFields;
 std::once_flag g_startOnce;
 std::mutex g_apiMutex;
 std::mutex g_imageMutex;
 std::condition_variable g_imageChanged;
+std::mutex g_classCacheMutex;
+std::unordered_map<std::string, Il2CppClass *> g_classCache;
 std::string g_moduleName;
 std::string g_requestedModule;
 double g_timeout = 20.0;
-
-bool ResolveOfflineMetadata();
 
 void ImageAdded(const mach_header *, std::intptr_t) {
   g_imageChanged.notify_all();
@@ -133,6 +114,12 @@ ApiResult ResolveApi() {
       Symbol<decltype(api.classGetName)>("il2cpp_class_get_name");
   api.classGetNamespace =
       Symbol<decltype(api.classGetNamespace)>("il2cpp_class_get_namespace");
+  api.classGetElementClass = Symbol<decltype(api.classGetElementClass)>(
+      "il2cpp_class_get_element_class");
+  api.classArrayElementSize = Symbol<decltype(api.classArrayElementSize)>(
+      "il2cpp_class_array_element_size");
+  api.objectGetClass =
+      Symbol<decltype(api.objectGetClass)>("il2cpp_object_get_class");
   api.classGetMethods =
       Symbol<decltype(api.classGetMethods)>("il2cpp_class_get_methods");
   api.classGetMethodFromName = Symbol<decltype(api.classGetMethodFromName)>(
@@ -141,6 +128,10 @@ ApiResult ResolveApi() {
       Symbol<decltype(api.methodGetName)>("il2cpp_method_get_name");
   api.methodGetParamCount = Symbol<decltype(api.methodGetParamCount)>(
       "il2cpp_method_get_param_count");
+  api.methodGetParam =
+      Symbol<decltype(api.methodGetParam)>("il2cpp_method_get_param");
+  api.typeGetName = Symbol<decltype(api.typeGetName)>("il2cpp_type_get_name");
+  api.freeMemory = Symbol<decltype(api.freeMemory)>("il2cpp_free");
   api.classGetFieldFromName = Symbol<decltype(api.classGetFieldFromName)>(
       "il2cpp_class_get_field_from_name");
   api.classGetPropertyFromName = Symbol<decltype(api.classGetPropertyFromName)>(
@@ -182,7 +173,7 @@ ApiResult ResolveApi() {
   auto *domain = api.domainGet();
   if (!domain)
     return ApiResult::NotReady;
-  std::uint64_t capabilities = Assemblies;
+  std::uint64_t capabilities = Assemblies | NativeMethodPointers;
   if (api.classFromName)
     capabilities |= Classes;
   if (api.classGetMethodFromName ||
@@ -194,7 +185,8 @@ ApiResult ResolveApi() {
     capabilities |= Fields;
   if (api.classGetPropertyFromName)
     capabilities |= Properties;
-  if (api.stringNew && api.stringChars && api.stringLength)
+  if (api.stringChars && api.stringLength &&
+      (api.stringNew || (api.classFromName && api.classGetMethods)))
     capabilities |= Strings;
   if (api.runtimeInvoke)
     capabilities |= Invocation;
@@ -210,8 +202,6 @@ ApiResult ResolveApi() {
   {
     std::lock_guard<std::mutex> lock(g_apiMutex);
     g_api = api;
-    if (g_methodPointerAdapter.load(std::memory_order_acquire))
-      capabilities |= NativeMethodPointers;
     g_capabilities.store(capabilities, std::memory_order_release);
     g_apiPublished.store(true, std::memory_order_release);
   }
@@ -234,15 +224,6 @@ bool RequestedModuleLoaded() {
   return false;
 }
 
-std::uintptr_t RequestedModuleBase() {
-  if (g_requestedModule.empty() || g_requestedModule == "main") {
-    return _dyld_image_count()
-               ? reinterpret_cast<std::uintptr_t>(_dyld_get_image_header(0))
-               : 0;
-  }
-  return FindImageBaseByName(g_requestedModule.c_str());
-}
-
 void InitializeWorker() {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(static_cast<long long>(
@@ -250,17 +231,6 @@ void InitializeWorker() {
   g_status.store(Status::WaitingForModule, std::memory_order_release);
   std::unique_lock<std::mutex> lock(g_imageMutex);
   while (std::chrono::steady_clock::now() < deadline) {
-    if (g_staticStringFactoryRva &&
-        !g_staticStringFactory.load(std::memory_order_acquire)) {
-      const auto base = RequestedModuleBase();
-      if (base) {
-        g_staticStringFactory.store(
-            reinterpret_cast<StaticStringFactory>(base + g_staticStringFactoryRva),
-            std::memory_order_release);
-        Logf("IL2CPP static UTF-16 string factory configured at +0x%llx",
-             static_cast<unsigned long long>(g_staticStringFactoryRva));
-      }
-    }
     if (RequestedModuleLoaded()) {
       g_status.store(Status::WaitingForRuntime, std::memory_order_release);
       lock.unlock();
@@ -271,25 +241,11 @@ void InitializeWorker() {
              static_cast<unsigned long long>(GetCapabilities()));
         return;
       }
-      // Exports exist but IL2CPP is still booting: keep waiting rather than
-      // locking in the offline-only resolver.
-      if (result == ApiResult::Unavailable && ResolveOfflineMetadata()) {
-        Logf("IL2CPP offline metadata resolver active; module=%s capabilities=0x%llx",
-             GetResolvedModule(),
-             static_cast<unsigned long long>(GetCapabilities()));
-        return;
-      }
       lock.lock();
     }
     g_imageChanged.wait_for(lock, std::chrono::milliseconds(100));
   }
   lock.unlock();
-  if (ResolveOfflineMetadata()) {
-    Logf("IL2CPP runtime not initialized before timeout; offline metadata "
-         "resolver active; module=%s",
-         GetResolvedModule());
-    return;
-  }
   g_status.store(Status::RuntimeFunctionsUnavailable,
                  std::memory_order_release);
   Log(OBF("IL2CPP resolver timed out; unrelated IAOT systems remain enabled"));
@@ -312,49 +268,127 @@ bool SameImageName(const char *actual, const char *requested) {
          std::strncmp(actual, requested, actualLength) == 0;
 }
 
-bool OfflineModuleMatches(const char *binding, const char *requested) {
-  if (!binding || !requested)
-    return false;
-  if (SameImageName(binding, requested))
-    return true;
-  return std::strcmp(requested, "main") == 0 &&
-         (g_requestedModule.empty() ||
-          SameImageName(binding, g_requestedModule.c_str()));
+// Every loaded managed image, in domain order.
+std::vector<const Il2CppImage *> Images(const Api &api) {
+  std::vector<const Il2CppImage *> images;
+  if (!api.domainGet || !api.domainGetAssemblies || !api.assemblyGetImage)
+    return images;
+  auto *domain = api.domainGet();
+  std::size_t count = 0;
+  const auto **assemblies =
+      domain ? api.domainGetAssemblies(domain, &count) : nullptr;
+  if (!assemblies || count > 100000)
+    return images;
+  images.reserve(count);
+  for (std::size_t index = 0; index < count; ++index)
+    if (const auto *image = api.assemblyGetImage(assemblies[index]))
+      images.push_back(image);
+  return images;
 }
 
-std::uintptr_t OfflineModuleBase(const char *module) {
-  if (!module || !*module || std::strcmp(module, "main") == 0)
-    return RequestedModuleBase();
-  if (const auto base = FindImageBaseByName(module))
-    return base;
-  return RequestedModuleBase();
+Il2CppClass *TopLevelClass(const Api &api, const Il2CppImage *image,
+                           const char *namespc, const char *name) {
+  if (!api.classFromName)
+    return nullptr;
+  if (image)
+    return api.classFromName(image, namespc, name);
+  for (const auto *candidate : Images(api))
+    if (auto *klass = api.classFromName(candidate, namespc, name))
+      return klass;
+  return nullptr;
 }
 
-bool ResolveOfflineMetadata() {
-  if (!g_offlineMetadata && !g_staticStringFactoryRva)
-    return false;
-
-  std::uint64_t capabilities = 0;
-  if (g_offlineMetadata) {
-    if (g_offlineMetadata->classCount)
-      capabilities |= Classes;
-    if (g_offlineMetadata->methodCount)
-      capabilities |= Methods | NativeMethodPointers;
-    if (g_offlineMetadata->fieldCount)
-      capabilities |= Fields;
-    if (g_offlineMetadata->internalCallCount)
-      capabilities |= InternalCalls;
+// "Outer+Inner" / "Outer/Inner" -> the nested class.
+Il2CppClass *ResolveClass(const Api &api, const Il2CppImage *image,
+                          const char *namespc, const char *name) {
+  const char *split = std::strpbrk(name, "+/");
+  if (!split)
+    return TopLevelClass(api, image, namespc, name);
+  auto *klass = TopLevelClass(api, image, namespc,
+                              std::string(name, split).c_str());
+  while (klass && split) {
+    const char *part = split + 1;
+    split = std::strpbrk(part, "+/");
+    const std::string nested =
+        split ? std::string(part, split) : std::string(part);
+    klass = FindNestedClass(klass, nested.c_str());
   }
-  if (g_staticStringFactoryRva)
-    capabilities |= Strings;
-  if (!capabilities)
-    return false;
+  return klass;
+}
 
-  g_moduleName = g_requestedModule;
-  g_capabilities.store(capabilities, std::memory_order_release);
-  g_apiPublished.store(true, std::memory_order_release);
-  g_status.store(Status::PartiallyAvailable, std::memory_order_release);
+// Managed type names compare with '/' and '+' as the same nesting separator.
+// A wanted name without a namespace matches the actual name's last segment.
+bool SameTypeName(const char *actual, const char *wanted) {
+  if (!actual || !wanted)
+    return false;
+  auto same = [](const char *a, const char *b) {
+    for (; *a && *b; ++a, ++b) {
+      const char x = *a == '/' ? '+' : *a;
+      const char y = *b == '/' ? '+' : *b;
+      if (x != y)
+        return false;
+    }
+    return *a == *b;
+  };
+  if (same(actual, wanted))
+    return true;
+  if (std::strchr(wanted, '.'))
+    return false;
+  const char *dot = std::strrchr(actual, '.');
+  return dot && same(dot + 1, wanted);
+}
+
+bool ParameterTypesMatch(const Api &api, const MethodInfo *method,
+                         std::initializer_list<const char *> types) {
+  std::uint32_t index = 0;
+  for (const char *wanted : types) {
+    const auto *type = api.methodGetParam(method, index++);
+    char *actual = type ? api.typeGetName(type) : nullptr;
+    const bool match = SameTypeName(actual, wanted);
+    if (actual && api.freeMemory)
+      api.freeMemory(actual);
+    if (!match)
+      return false;
+  }
   return true;
+}
+
+// Searches `klass`, then each base class, for methods named `name` that pass
+// `accept`. The first class with any match decides; several matches there
+// are ambiguous and set `ambiguous`.
+template <typename Accept>
+const MethodInfo *FindDeclaredMethod(const Api &api, Il2CppClass *klass,
+                                     const char *name, int parameterCount,
+                                     Accept &&accept, bool &ambiguous) {
+  ambiguous = false;
+  for (int depth = 0; klass && depth < 64;
+       ++depth, klass = api.classGetParent ? api.classGetParent(klass) : nullptr) {
+    void *iterator = nullptr;
+    const MethodInfo *result = nullptr;
+    std::size_t visited = 0;
+    while (const auto *candidate = api.classGetMethods(klass, &iterator)) {
+      if (++visited > 100000)
+        return nullptr;
+      const char *candidateName = api.methodGetName(candidate);
+      if (!candidateName || std::strcmp(candidateName, name) != 0)
+        continue;
+      if (parameterCount >= 0 && api.methodGetParamCount(candidate) !=
+                                     static_cast<std::uint32_t>(parameterCount))
+        continue;
+      if (!accept(candidate))
+        continue;
+      if (result) {
+        Logf("IL2CPP method is ambiguous: %s/%d; pass parameter types", name,
+             parameterCount);
+        ambiguous = true;
+        return nullptr;
+      }
+      result = candidate;
+    }
+    if (result)
+      return result;
+  }
+  return nullptr;
 }
 
 void AppendUtf8(std::string &output, std::uint32_t codepoint) {
@@ -374,6 +408,9 @@ void AppendUtf8(std::string &output, std::uint32_t codepoint) {
     output.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
   }
 }
+
+// Managed object header (klass + monitor), the base of every field offset.
+constexpr std::size_t kObjectHeaderSize = 2 * sizeof(void *);
 } // namespace
 
 bool InitializeAsync(const Options &options) {
@@ -381,15 +418,6 @@ bool InitializeAsync(const Options &options) {
     if (options.moduleName)
       g_requestedModule = options.moduleName;
     g_timeout = options.timeoutSeconds;
-    g_staticStringFactoryRva = options.stringFactoryRva;
-    g_offlineMetadata = options.offlineMetadata;
-    if (g_staticStringFactoryRva) {
-      if (const auto base = RequestedModuleBase()) {
-        g_staticStringFactory.store(
-            reinterpret_cast<StaticStringFactory>(base + g_staticStringFactoryRva),
-            std::memory_order_release);
-      }
-    }
     g_status.store(Status::Initializing, std::memory_order_release);
     _dyld_register_func_for_add_image(ImageAdded);
     std::thread(InitializeWorker).detach();
@@ -443,27 +471,8 @@ const char *GetResolvedModule() {
     return OBF("");
   return g_moduleName.empty() ? OBF("") : g_moduleName.c_str();
 }
-std::size_t GetOfflineClassCount() {
-  return g_offlineMetadata ? g_offlineMetadata->classCount : 0;
-}
-bool GetOfflineClassAt(std::size_t index, const char **module,
-                       const char **namespc, const char **name) {
-  if (!g_offlineMetadata || index >= g_offlineMetadata->classCount)
-    return false;
-  const auto &binding = g_offlineMetadata->classes[index];
-  if (module) *module = binding.module;
-  if (namespc) *namespc = binding.namespc;
-  if (name) *name = binding.name;
-  return true;
-}
 void SetMethodPointerAdapter(MethodPointerAdapter adapter) {
-  std::lock_guard<std::mutex> lock(g_apiMutex);
   g_methodPointerAdapter.store(adapter, std::memory_order_release);
-  if (adapter)
-    g_capabilities.fetch_or(NativeMethodPointers, std::memory_order_acq_rel);
-  else
-    g_capabilities.fetch_and(~static_cast<std::uint64_t>(NativeMethodPointers),
-                             std::memory_order_acq_rel);
 }
 
 const Il2CppAssembly *FindAssembly(const char *name) {
@@ -493,77 +502,42 @@ const Il2CppImage *FindImage(const char *name) {
                                           : nullptr;
 }
 
-OfflineClassHandle *OfflineClass(Il2CppClass *klass) {
-  std::lock_guard<std::mutex> lock(g_offlineMutex);
-  for (const auto &candidate : g_offlineClasses)
-    if (reinterpret_cast<Il2CppClass *>(candidate.get()) == klass)
-      return candidate.get();
-  return nullptr;
-}
-
-OfflineMethodHandle *OfflineMethod(const MethodInfo *method) {
-  std::lock_guard<std::mutex> lock(g_offlineMutex);
-  for (const auto &candidate : g_offlineMethods)
-    if (reinterpret_cast<const MethodInfo *>(candidate.get()) == method)
-      return candidate.get();
-  return nullptr;
-}
-
-OfflineFieldHandle *OfflineField(const FieldInfo *field) {
-  std::lock_guard<std::mutex> lock(g_offlineMutex);
-  for (const auto &candidate : g_offlineFields)
-    if (reinterpret_cast<const FieldInfo *>(candidate.get()) == field)
-      return candidate.get();
-  return nullptr;
-}
-
-const OfflineClassBinding *FindOfflineClassBinding(const char *image,
-                                                   const char *namespc,
-                                                   const char *name) {
-  if (!g_offlineMetadata || !image || !name)
-    return nullptr;
-  for (std::size_t index = 0; index < g_offlineMetadata->classCount; ++index) {
-    const auto &binding = g_offlineMetadata->classes[index];
-    if (OfflineModuleMatches(binding.module, image) &&
-        std::strcmp(binding.namespc ? binding.namespc : "",
-                    namespc ? namespc : "") == 0 &&
-        std::strcmp(binding.name ? binding.name : "", name) == 0)
-      return &binding;
-  }
-  return nullptr;
-}
-
 Il2CppClass *FindClass(const char *image, const char *namespc,
                        const char *name) {
-  if (!name)
+  if (!name || !*name || !(GetCapabilities() & Classes))
     return nullptr;
-  // Prefer a real runtime class whenever IL2CPP metadata is available.
-  // Offline handles are address-resolution fallbacks and must never shadow a
-  // real class because they cannot be passed to il2cpp_runtime_invoke.
-  const auto *resolved = FindImage(image);
-  const auto api = ApiSnapshot();
-  if (resolved && api.classFromName)
-    if (auto *runtimeClass =
-            api.classFromName(resolved, namespc ? namespc : OBF(""), name))
-      return runtimeClass;
-
-  if (const auto *binding = FindOfflineClassBinding(image, namespc, name)) {
-    std::lock_guard<std::mutex> lock(g_offlineMutex);
-    for (const auto &candidate : g_offlineClasses)
-      if (candidate->binding == binding)
-        return reinterpret_cast<Il2CppClass *>(candidate.get());
-    auto candidate = std::make_unique<OfflineClassHandle>();
-    candidate->binding = binding;
-    auto *result = reinterpret_cast<Il2CppClass *>(candidate.get());
-    g_offlineClasses.push_back(std::move(candidate));
-    return result;
+  const char *space = namespc ? namespc : "";
+  std::string key = image ? image : "";
+  key.push_back('\n');
+  key += space;
+  key.push_back('\n');
+  key += name;
+  {
+    std::lock_guard<std::mutex> lock(g_classCacheMutex);
+    if (const auto found = g_classCache.find(key); found != g_classCache.end())
+      return found->second;
   }
-  return nullptr;
+  const auto api = ApiSnapshot();
+  Il2CppClass *klass = nullptr;
+  if (image && *image)
+    if (const auto *resolved = FindImage(image))
+      klass = ResolveClass(api, resolved, space, name);
+  // Not a managed assembly name (e.g. the native "UnityFramework"), or the
+  // type lives elsewhere: every loaded assembly is searched by name.
+  if (!klass)
+    klass = ResolveClass(api, nullptr, space, name);
+  if (klass) {
+    std::lock_guard<std::mutex> lock(g_classCacheMutex);
+    g_classCache.emplace(std::move(key), klass);
+  }
+  return klass;
+}
+Il2CppClass *FindClass(const char *namespc, const char *name) {
+  return FindClass(nullptr, namespc, name);
 }
 Il2CppClass *FindNestedClass(Il2CppClass *parent, const char *name) {
   const auto api = ApiSnapshot();
-  if (!parent || !name || OfflineClass(parent) || !api.classGetNestedTypes ||
-      !api.classGetName)
+  if (!parent || !name || !api.classGetNestedTypes || !api.classGetName)
     return nullptr;
   void *iterator = nullptr;
   while (auto *nested = api.classGetNestedTypes(parent, &iterator))
@@ -573,185 +547,107 @@ Il2CppClass *FindNestedClass(Il2CppClass *parent, const char *name) {
   return nullptr;
 }
 Il2CppClass *GetParentClass(Il2CppClass *klass) {
-  if (!klass || OfflineClass(klass))
+  if (!klass)
     return nullptr;
   const auto api = ApiSnapshot();
   return api.classGetParent ? api.classGetParent(klass) : nullptr;
 }
+Il2CppClass *ObjectClass(const Il2CppObject *object) {
+  if (!object)
+    return nullptr;
+  const auto api = ApiSnapshot();
+  if (api.objectGetClass)
+    return api.objectGetClass(object);
+  // Il2CppObject always starts with its class pointer.
+  return *reinterpret_cast<Il2CppClass *const *>(object);
+}
 const char *ClassName(Il2CppClass *klass) {
-  if (!klass || OfflineClass(klass))
+  if (!klass)
     return nullptr;
   const auto api = ApiSnapshot();
   return api.classGetName ? api.classGetName(klass) : nullptr;
 }
-// Returns the handle for an audited offline method binding. A null `module`
-// matches any module (used when the class came from the live runtime API).
-const MethodInfo *FindOfflineMethod(const char *module, const char *namespc,
-                                    const char *klass, const char *name,
-                                    int parameterCount) {
-  if (!g_offlineMetadata || !klass || !name)
+const char *ClassNamespace(Il2CppClass *klass) {
+  if (!klass)
     return nullptr;
-  std::lock_guard<std::mutex> lock(g_offlineMutex);
-  for (std::size_t index = 0; index < g_offlineMetadata->methodCount; ++index) {
-    const auto &binding = g_offlineMetadata->methods[index];
-    if ((module && std::strcmp(binding.module ? binding.module : "", module) != 0) ||
-        std::strcmp(binding.namespc ? binding.namespc : "",
-                    namespc ? namespc : "") != 0 ||
-        std::strcmp(binding.klass ? binding.klass : "", klass) != 0 ||
-        std::strcmp(binding.name ? binding.name : "", name) != 0 ||
-        (parameterCount >= 0 && binding.parameterCount >= 0 &&
-         binding.parameterCount != parameterCount))
-      continue;
-    for (const auto &candidate : g_offlineMethods)
-      if (candidate->binding == &binding)
-        return reinterpret_cast<const MethodInfo *>(candidate.get());
-    auto candidate = std::make_unique<OfflineMethodHandle>();
-    candidate->binding = &binding;
-    auto *result = reinterpret_cast<const MethodInfo *>(candidate.get());
-    g_offlineMethods.push_back(std::move(candidate));
-    return result;
-  }
-  return nullptr;
+  const auto api = ApiSnapshot();
+  return api.classGetNamespace ? api.classGetNamespace(klass) : nullptr;
 }
 
 const MethodInfo *FindMethod(Il2CppClass *klass, const char *name,
                               int parameterCount) {
-  if (const auto *offlineClass = OfflineClass(klass);
-      offlineClass && g_offlineMetadata && name) {
-    const auto *binding = offlineClass->binding;
-    return FindOfflineMethod(binding->module ? binding->module : "",
-                             binding->namespc, binding->name, name,
-                             parameterCount);
-  }
   const auto api = ApiSnapshot();
   if (!klass || !name)
     return nullptr;
-  // A live runtime MethodInfo has no native pointer without an adapter, and
-  // the runtime cannot tell same-arity overloads apart. When the project
-  // declared an audited binding for this exact class/method/arity, use it.
-  if (g_offlineMetadata && api.classGetName && api.classGetNamespace &&
-      !g_methodPointerAdapter.load(std::memory_order_acquire))
-    if (const auto *offline = FindOfflineMethod(
-            nullptr, api.classGetNamespace(klass), api.classGetName(klass),
-            name, parameterCount))
-      return offline;
   if (api.classGetMethods && api.methodGetName && api.methodGetParamCount) {
-    void *iterator = nullptr;
-    const MethodInfo *result = nullptr;
-    std::size_t visited = 0;
-    while (const auto *candidate = api.classGetMethods(klass, &iterator)) {
-      if (++visited > 100000)
-        return nullptr;
-      const char *candidateName = api.methodGetName(candidate);
-      const bool countMatches =
-          parameterCount < 0 || api.methodGetParamCount(candidate) ==
-                                    static_cast<std::uint32_t>(parameterCount);
-      if (candidateName && std::strcmp(candidateName, name) == 0 &&
-          countMatches) {
-        if (result) {
-          Logf("IL2CPP method is ambiguous: %s/%d", name, parameterCount);
-          return nullptr;
-        }
-        result = candidate;
-      }
-    }
-    if (result)
-      return result;
-    // Unity's method iterator only enumerates methods declared on the class.
-    // The named lookup can also resolve inherited methods, including generic
-    // ClientSystem<T>.get_Instance accessors used by StageManager.
-    if (api.classGetMethodFromName)
-      return api.classGetMethodFromName(klass, name, parameterCount);
-    return nullptr;
+    bool ambiguous = false;
+    if (const auto *method =
+            FindDeclaredMethod(api, klass, name, parameterCount,
+                               [](const MethodInfo *) { return true; }, ambiguous))
+      return method;
+    if (ambiguous)
+      return nullptr;
   }
   return api.classGetMethodFromName
              ? api.classGetMethodFromName(klass, name, parameterCount)
              : nullptr;
 }
-FieldInfo *FindField(Il2CppClass *klass, const char *name) {
-  if (const auto *offlineClass = OfflineClass(klass);
-      offlineClass && g_offlineMetadata && name) {
-    std::lock_guard<std::mutex> lock(g_offlineMutex);
-    for (std::size_t index = 0; index < g_offlineMetadata->fieldCount;
-         ++index) {
-      const auto &binding = g_offlineMetadata->fields[index];
-      if (std::strcmp(binding.module ? binding.module : "",
-                      offlineClass->binding->module
-                          ? offlineClass->binding->module
-                          : "") != 0 ||
-          std::strcmp(binding.namespc ? binding.namespc : "",
-                      offlineClass->binding->namespc
-                          ? offlineClass->binding->namespc
-                          : "") != 0 ||
-          std::strcmp(binding.klass ? binding.klass : "",
-                      offlineClass->binding->name
-                          ? offlineClass->binding->name
-                          : "") != 0 ||
-          std::strcmp(binding.name ? binding.name : "", name) != 0)
-        continue;
-      for (const auto &candidate : g_offlineFields)
-        if (candidate->binding == &binding)
-          return reinterpret_cast<FieldInfo *>(candidate.get());
-      auto candidate = std::make_unique<OfflineFieldHandle>();
-      candidate->binding = &binding;
-      auto *result = reinterpret_cast<FieldInfo *>(candidate.get());
-      g_offlineFields.push_back(std::move(candidate));
-      return result;
-    }
-  }
+const MethodInfo *FindMethod(Il2CppClass *klass, const char *name,
+                              std::initializer_list<const char *> types) {
   const auto api = ApiSnapshot();
-  return klass && name && !OfflineClass(klass) && api.classGetFieldFromName
+  if (!klass || !name)
+    return nullptr;
+  if (!api.classGetMethods || !api.methodGetName || !api.methodGetParamCount)
+    return nullptr;
+  const int count = static_cast<int>(types.size());
+  if (!api.methodGetParam || !api.typeGetName) {
+    Logf("IL2CPP parameter type exports are missing; %s/%d resolved by arity",
+         name, count);
+    return FindMethod(klass, name, count);
+  }
+  bool ambiguous = false;
+  return FindDeclaredMethod(
+      api, klass, name, count,
+      [&](const MethodInfo *candidate) {
+        return ParameterTypesMatch(api, candidate, types);
+      },
+      ambiguous);
+}
+FieldInfo *FindField(Il2CppClass *klass, const char *name) {
+  const auto api = ApiSnapshot();
+  // il2cpp_class_get_field_from_name already walks the base classes.
+  return klass && name && api.classGetFieldFromName
              ? api.classGetFieldFromName(klass, name)
              : nullptr;
 }
+FieldInfo *FindObjectField(const Il2CppObject *object, const char *name) {
+  return FindField(ObjectClass(object), name);
+}
 const PropertyInfo *FindProperty(Il2CppClass *klass, const char *name) {
   const auto api = ApiSnapshot();
-  return klass && name && !OfflineClass(klass) && api.classGetPropertyFromName
+  return klass && name && api.classGetPropertyFromName
              ? api.classGetPropertyFromName(klass, name)
              : nullptr;
 }
 std::uintptr_t NativeMethodPointer(const MethodInfo *method) {
-  const auto adapter = g_methodPointerAdapter.load(std::memory_order_acquire);
-  if (method && adapter)
-    if (const auto address = adapter(method))
-      return address;
-  if (const auto *offline = OfflineMethod(method)) {
-    const auto *binding = offline->binding;
-    const auto base = binding ? OfflineModuleBase(binding->module) : 0;
-    return base && binding ? base + binding->rva : 0;
-  }
-  return 0;
-}
-std::uintptr_t OfflineMethodPointer(const char *assemblyOrImageName,
-                                    const char *namespc, const char *klass,
-                                    const char *name, int parameterCount) {
-  if (!g_offlineMetadata || !assemblyOrImageName || !klass || !name)
+  if (!method)
     return 0;
-  const char *wantedNamespace = namespc ? namespc : "";
-  for (std::size_t index = 0; index < g_offlineMetadata->methodCount; ++index) {
-    const auto &binding = g_offlineMetadata->methods[index];
-    if (!OfflineModuleMatches(binding.module, assemblyOrImageName) ||
-        std::strcmp(binding.namespc ? binding.namespc : "",
-                    wantedNamespace) != 0 ||
-        std::strcmp(binding.klass ? binding.klass : "", klass) != 0 ||
-        std::strcmp(binding.name ? binding.name : "", name) != 0 ||
-        (parameterCount >= 0 && binding.parameterCount >= 0 &&
-         binding.parameterCount != parameterCount))
-      continue;
-    const auto base = OfflineModuleBase(binding.module);
-    return base ? base + binding.rva : 0;
-  }
-  return 0;
+  if (const auto adapter = g_methodPointerAdapter.load(std::memory_order_acquire))
+    return adapter(method);
+  // MethodInfo::methodPointer is the first member in every IL2CPP version
+  // since Unity 5. Only accept an address inside a loaded image.
+  const auto pointer = *reinterpret_cast<const std::uintptr_t *>(method);
+  Dl_info info{};
+  if (!pointer || !dladdr(reinterpret_cast<const void *>(pointer), &info) ||
+      !info.dli_fbase)
+    return 0;
+  return pointer;
 }
 Il2CppObject *Invoke(const MethodInfo *method, Il2CppObject *instance,
                      void **arguments, Il2CppException **exception) {
   const auto api = ApiSnapshot();
   if (!method || !api.runtimeInvoke)
     return nullptr;
-  if (OfflineMethod(method)) {
-    Logf("refusing to runtime-invoke an offline method handle");
-    return nullptr;
-  }
   if (api.threadAttach)
     if (auto *domain = api.domainGet())
       api.threadAttach(domain);
@@ -762,21 +658,62 @@ Il2CppObject *Invoke(const MethodInfo *method, Il2CppObject *instance,
 std::uintptr_t ResolveInternalCall(const char *name) {
   const auto api = ApiSnapshot();
   if (name && api.resolveIcall)
-    if (const auto address = reinterpret_cast<std::uintptr_t>(api.resolveIcall(name)))
-      return address;
-  if (name && g_offlineMetadata)
-    for (std::size_t index = 0; index < g_offlineMetadata->internalCallCount;
-         ++index) {
-      const auto &binding = g_offlineMetadata->internalCalls[index];
-      if (binding.name && std::strcmp(binding.name, name) == 0) {
-        const auto base = OfflineModuleBase(binding.module);
-        return base ? base + binding.rva : 0;
-      }
-    }
+    return reinterpret_cast<std::uintptr_t>(api.resolveIcall(name));
   return 0;
 }
 
+namespace Array {
+std::size_t ElementSize(const Il2CppObject *array) {
+  const auto api = ApiSnapshot();
+  auto *klass = ObjectClass(array);
+  return klass && api.classArrayElementSize
+             ? static_cast<std::size_t>(api.classArrayElementSize(klass))
+             : 0;
+}
+Il2CppClass *ElementClass(const Il2CppObject *array) {
+  const auto api = ApiSnapshot();
+  auto *klass = ObjectClass(array);
+  return klass && api.classGetElementClass ? api.classGetElementClass(klass)
+                                           : nullptr;
+}
+} // namespace Array
+
 namespace String {
+namespace {
+// Stripped players keep the managed constructors that il2cpp_string_new
+// would otherwise wrap. Both take (char*, startIndex, length).
+using StaticCtor = Il2CppString *(*)(const std::uint16_t *, std::int32_t,
+                                     std::int32_t, const MethodInfo *);
+using InstanceCtor = Il2CppString *(*)(void *, const std::uint16_t *,
+                                       std::int32_t, std::int32_t,
+                                       const MethodInfo *);
+struct ManagedFactory {
+  const MethodInfo *method{};
+  std::uintptr_t pointer{};
+  bool isStatic{};
+};
+ManagedFactory FindManagedFactory() {
+  static std::mutex mutex;
+  static ManagedFactory cached;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (cached.pointer)
+    return cached;
+  auto *klass = FindClass(OBF("System"), OBF("String"));
+  if (!klass)
+    return {};
+  const char *charPointer = OBF("System.Char*");
+  const char *int32 = OBF("System.Int32");
+  if (const auto *method =
+          FindMethod(klass, OBF("Ctor"), {charPointer, int32, int32}))
+    cached = {method, NativeMethodPointer(method), true};
+  if (!cached.pointer)
+    if (const auto *method =
+            FindMethod(klass, OBF("CreateString"), {charPointer, int32, int32}))
+      cached = {method, NativeMethodPointer(method), false};
+  return cached;
+}
+} // namespace
+
 Il2CppString *New(const char *utf8) {
   const auto api = ApiSnapshot();
   if (!utf8)
@@ -784,8 +721,8 @@ Il2CppString *New(const char *utf8) {
   if (api.stringNew)
     return api.stringNew(utf8);
 
-  const auto factory = g_staticStringFactory.load(std::memory_order_acquire);
-  if (!factory)
+  const auto factory = FindManagedFactory();
+  if (!factory.pointer)
     return nullptr;
 
   @autoreleasepool {
@@ -796,7 +733,12 @@ Il2CppString *New(const char *utf8) {
     std::vector<std::uint16_t> utf16(length + 1, 0);
     [value getCharacters:reinterpret_cast<unichar *>(utf16.data())
                     range:NSMakeRange(0, length)];
-    return factory(nullptr, utf16.data(), nullptr);
+    const auto count = static_cast<std::int32_t>(length);
+    if (factory.isStatic)
+      return reinterpret_cast<StaticCtor>(factory.pointer)(
+          utf16.data(), 0, count, factory.method);
+    return reinterpret_cast<InstanceCtor>(factory.pointer)(
+        nullptr, utf16.data(), 0, count, factory.method);
   }
 }
 std::string ToUtf8(const Il2CppString *value) {
@@ -809,17 +751,12 @@ std::string ToUtf8(const Il2CppString *value) {
     characters = api.stringChars(value);
     length = api.stringLength(value);
   } else {
-    // Hardened targets (e.g. this game) ship with the il2cpp C exports stripped,
-    // so il2cpp_string_chars/il2cpp_string_length resolve to null and the API
-    // path above is unavailable. The managed System.String memory layout is
-    // stable across every il2cpp version: an Il2CppObject header (klass +
-    // monitor = 16 bytes on 64-bit), an int32 length at offset 0x10, then the
-    // UTF-16 code units at offset 0x14. Read it directly so text reads still
-    // work without the runtime API. This is the only way to recover string
-    // contents when the exports are absent.
+    // Without the exports, read System.String's fixed runtime layout: the
+    // object header, an int32 length at 0x10, then UTF-16 code units at 0x14.
     const auto *bytes = reinterpret_cast<const std::uint8_t *>(value);
-    std::memcpy(&length, bytes + 16, sizeof(length));
-    characters = reinterpret_cast<const std::uint16_t *>(bytes + 20);
+    std::memcpy(&length, bytes + kObjectHeaderSize, sizeof(length));
+    characters = reinterpret_cast<const std::uint16_t *>(
+        bytes + kObjectHeaderSize + sizeof(length));
   }
   if (!characters || length < 0 || length > 100000000)
     return {};
@@ -863,18 +800,20 @@ void Unpin(Handle handle) {
 } // namespace GC
 
 namespace Field {
-// Offline handles are synthetic and must never reach the live il2cpp_field_*
-// API: it would read their bytes as a FieldInfo. Check them first.
 std::size_t Offset(const FieldInfo *field) {
-  if (const auto *offline = OfflineField(field))
-    return offline->binding ? offline->binding->offset : 0;
   const auto api = ApiSnapshot();
   if (field && api.fieldGetOffset)
     return api.fieldGetOffset(field);
   return 0;
 }
+std::size_t ValueOffset(const FieldInfo *field) {
+  // A value type's field offsets include the boxed object header even though
+  // an unboxed instance (an array element, a struct field) has none.
+  const auto offset = Offset(field);
+  return offset >= kObjectHeaderSize ? offset - kObjectHeaderSize : 0;
+}
 bool GetStatic(const FieldInfo *field, void *output) {
-  if (!field || !output || OfflineField(field))
+  if (!field || !output)
     return false;
   const auto api = ApiSnapshot();
   if (api.fieldStaticGetValue) {
@@ -884,7 +823,7 @@ bool GetStatic(const FieldInfo *field, void *output) {
   return false;
 }
 bool SetStatic(FieldInfo *field, const void *value) {
-  if (!field || !value || OfflineField(field))
+  if (!field || !value)
     return false;
   const auto api = ApiSnapshot();
   if (api.fieldStaticSetValue) {
@@ -896,15 +835,6 @@ bool SetStatic(FieldInfo *field, const void *value) {
 bool GetInstance(Il2CppObject *object, const FieldInfo *field, void *output) {
   if (!object || !field || !output)
     return false;
-  if (const auto *offline = OfflineField(field)) {
-    if (!offline->binding)
-      return false;
-    std::memcpy(output,
-                reinterpret_cast<const std::uint8_t *>(object) +
-                    offline->binding->offset,
-                offline->binding->size);
-    return true;
-  }
   const auto api = ApiSnapshot();
   if (api.fieldGetValue) {
     api.fieldGetValue(object, field, output);
@@ -915,14 +845,6 @@ bool GetInstance(Il2CppObject *object, const FieldInfo *field, void *output) {
 bool SetInstance(Il2CppObject *object, FieldInfo *field, const void *value) {
   if (!object || !field || !value)
     return false;
-  if (const auto *offline = OfflineField(field)) {
-    if (!offline->binding)
-      return false;
-    std::memcpy(reinterpret_cast<std::uint8_t *>(object) +
-                    offline->binding->offset,
-                value, offline->binding->size);
-    return true;
-  }
   const auto api = ApiSnapshot();
   if (api.fieldSetValue) {
     api.fieldSetValue(object, field, const_cast<void *>(value));

@@ -1,5 +1,8 @@
 schema_version: 1
 
+# IL2CPP classes, methods and fields are found by name at runtime through the
+# game's own il2cpp_* exports, so no Cpp2IL/Il2CppDumper dump and no addresses
+# are needed here. A game update keeps working as long as the names exist.
 analysis:
   scripting_backend: auto
   il2cpp_module: null
@@ -7,14 +10,3 @@ analysis:
   runtime_il2cpp: true
   il2cpp_method_manifest: generated/reports/il2cpp-methods.yaml
   external_analyzer: auto
-
-runtime:
-  # Directory or file from a Cpp2IL/Il2CppDumper export. Leave null when
-  # exported runtime metadata is sufficient.
-  metadata_package: null
-  metadata_format: auto
-  string_factory: null
-  offline_classes: []
-  offline_methods: []
-  offline_fields: []
-  offline_internal_calls: []

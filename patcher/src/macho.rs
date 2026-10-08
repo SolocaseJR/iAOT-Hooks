@@ -1,9 +1,10 @@
 use crate::{
     arm64,
     caves::{self, CaveRequest},
+    il2cpp_name::{self, ManagedIndex, ManagedQuery},
     manifest::{
-        FailureBehavior, Locator, Manifest, Patch, PatchAction, Signature, SignatureKind,
-        VersionedRva,
+        ConflictPolicy, FailureBehavior, Instantiation, Locator, Manifest, Patch, PatchAction,
+        Signature, SignatureKind,
     },
     pattern,
 };
@@ -466,11 +467,7 @@ fn pattern_hits(
     Ok(hits)
 }
 /// File offset of the target one signature points at.
-fn resolve_signature(
-    data: &[u8],
-    parsed: &Parsed,
-    signature: &Signature,
-) -> anyhow::Result<usize> {
+fn resolve_signature(data: &[u8], parsed: &Parsed, signature: &Signature) -> anyhow::Result<usize> {
     let hits = pattern_hits(data, parsed, &signature.pattern, None, None)?;
     let hit = match (signature.match_index, hits.len()) {
         (None, 0) => anyhow::bail!("no match"),
@@ -500,15 +497,17 @@ fn locate_signatures(
     parsed: &Parsed,
     label: &str,
     signatures: &[Signature],
-    fallback: Option<&VersionedRva>,
-    versions: &[String],
 ) -> anyhow::Result<(usize, String)> {
     let mut resolved = Vec::new();
     let mut problems = Vec::new();
     for (index, signature) in signatures.iter().enumerate() {
         match resolve_signature(data, parsed, signature) {
             Ok(off) => resolved.push((index + 1, off)),
-            Err(error) => problems.push(format!("signature {} ({:?}): {error}", index + 1, signature.kind)),
+            Err(error) => problems.push(format!(
+                "signature {} ({:?}): {error}",
+                index + 1,
+                signature.kind
+            )),
         }
     }
     if let Some(&(_, first)) = resolved.first() {
@@ -534,25 +533,7 @@ fn locate_signatures(
         }
         return Ok((first, source));
     }
-    let problems = problems.join("; ");
-    match fallback {
-        Some(fallback) if versions.iter().any(|version| *version == fallback.version) => {
-            let off = vm_to_file(parsed, image_base(parsed)? + fallback.rva)?;
-            Ok((
-                off,
-                format!(
-                    "fallback rva 0x{:x} for version {} (no signature resolved: {problems})",
-                    fallback.rva, fallback.version
-                ),
-            ))
-        }
-        Some(fallback) => anyhow::bail!(
-            "{label}: no signature resolved ({problems}); the fallback rva is only valid for version {} and the detected versions are [{}]",
-            fallback.version,
-            versions.join(", ")
-        ),
-        None => anyhow::bail!("{label}: no signature resolved ({problems})"),
-    }
+    anyhow::bail!("{label}: no signature resolved ({})", problems.join("; "))
 }
 fn symbol_address(data: &[u8], name: &str) -> anyhow::Result<u64> {
     let file = object::File::parse(data)?;
@@ -659,25 +640,231 @@ fn resolve_il2cpp_locator(
         _ => anyhow::bail!("IL2CPP method entry must contain exactly one of rva or vmaddr"),
     }
 }
+/// Everything `locate` may consult besides the module itself.
+#[derive(Default)]
+pub struct LocateContext<'a> {
+    /// The managed index for this module, when the IPA had usable metadata.
+    managed: Option<&'a ManagedIndex<'a>>,
+    /// Why there is no managed index, for the error a named hook deserves.
+    managed_error: Option<String>,
+}
+
+/// A resolved target plus how it was found.
+#[cfg_attr(test, derive(Debug))]
+struct Located {
+    offset: usize,
+    vmaddr: u64,
+    source: String,
+    notes: Vec<String>,
+    /// Set when a managed name chose one generic instantiation.
+    instantiation: Option<String>,
+    /// Set when an entry stub was followed: the address before the hop.
+    stub_from: Option<u64>,
+}
+
+/// Builds a [`ManagedQuery`] from a manifest locator's managed options.
+fn managed_query(
+    spec: &str,
+    assembly: &Option<String>,
+    instantiation: &Option<Instantiation>,
+    offset: Option<i64>,
+    follow_entry_stub: Option<bool>,
+) -> anyhow::Result<ManagedQuery> {
+    let mut query = ManagedQuery::parse(spec)?;
+    query.assembly = assembly.clone();
+    query.offset = offset.unwrap_or(0);
+    query.follow_entry_stub = follow_entry_stub.unwrap_or(true);
+    query.instantiation = match instantiation {
+        None => None,
+        Some(Instantiation::Named(word)) => Some(match word.as_str() {
+            "any" => il2cpp_name::Instantiation::Any,
+            _ => il2cpp_name::Instantiation::Shared,
+        }),
+        Some(Instantiation::Args(args)) => Some(il2cpp_name::Instantiation::Args(args.clone())),
+    };
+    Ok(query)
+}
+
+/// Resolves a managed name against the index, or explains why it cannot.
+fn resolve_managed(
+    ctx: &LocateContext<'_>,
+    query: &ManagedQuery,
+) -> anyhow::Result<il2cpp_name::Resolution> {
+    let Some(index) = ctx.managed else {
+        anyhow::bail!(
+            "managed name {} needs the IPA's global-metadata.dat: {}",
+            query.display(),
+            ctx.managed_error
+                .as_deref()
+                .unwrap_or("no metadata was supplied to the patcher")
+        )
+    };
+    index.resolve(query)
+}
+
 fn locate(
     data: &[u8],
     parsed: &Parsed,
     manifest: &Manifest,
     patch: &Patch,
-    versions: &[String],
-) -> anyhow::Result<(usize, u64, String)> {
+    ctx: &LocateContext<'_>,
+) -> anyhow::Result<Located> {
     let locator = &patch.locator;
     let label = &patch.name;
     let mut source = locator_name(locator).to_string();
+    let mut notes = Vec::new();
+    let mut chosen_instantiation = None;
+    let mut stub_from = None;
     let off = match locator {
+        Locator::Managed {
+            method,
+            assembly,
+            instantiation,
+            offset,
+            follow_entry_stub,
+        } => {
+            let query = managed_query(
+                method,
+                assembly,
+                instantiation,
+                *offset,
+                *follow_entry_stub,
+            )?;
+            let resolution = resolve_managed(ctx, &query)?;
+            source = resolution.how.clone();
+            chosen_instantiation = resolution.instantiation.clone();
+            stub_from = resolution.stub_from;
+            notes.extend(resolution.notes);
+            vm_to_file(parsed, resolution.vmaddr)?
+        }
         Locator::Signatures {
             signatures,
-            fallback,
+            managed,
+            use_managed,
+            assembly,
+            instantiation,
+            on_conflict,
+            offset,
+            follow_entry_stub,
         } => {
-            let (off, found) =
-                locate_signatures(data, parsed, label, signatures, fallback.as_ref(), versions)?;
-            source = found;
-            off
+            let managed_spec = managed.as_deref().filter(|_| *use_managed);
+            let Some(spec) = managed_spec else {
+                if let Some(name) = managed {
+                    notes.push(format!(
+                        "managed name {name} is recorded but ignored (use_managed is false)"
+                    ));
+                }
+                let (off, found) = locate_signatures(data, parsed, label, signatures)?;
+                source = found;
+                return Ok(Located {
+                    offset: off,
+                    vmaddr: file_to_vm(parsed, off)?,
+                    source,
+                    notes,
+                    instantiation: None,
+                    stub_from: None,
+                });
+            };
+            let query = managed_query(
+                spec,
+                assembly,
+                instantiation,
+                *offset,
+                *follow_entry_stub,
+            )?;
+            let managed_result = resolve_managed(ctx, &query);
+            // Resolve every signature independently so a cross-check can name
+            // the ones that have drifted.
+            let mut resolved = Vec::new();
+            let mut problems = Vec::new();
+            for (index, signature) in signatures.iter().enumerate() {
+                match resolve_signature(data, parsed, signature) {
+                    Ok(off) => resolved.push((index + 1, off)),
+                    Err(error) => problems.push(format!(
+                        "signature {} ({:?}): {error}",
+                        index + 1,
+                        signature.kind
+                    )),
+                }
+            }
+            match managed_result {
+                Ok(resolution) => {
+                    let named = vm_to_file(parsed, resolution.vmaddr)?;
+                    let agreeing: Vec<usize> = resolved
+                        .iter()
+                        .filter(|(_, off)| *off == named)
+                        .map(|(number, _)| *number)
+                        .collect();
+                    let stale: Vec<(usize, usize)> = resolved
+                        .iter()
+                        .copied()
+                        .filter(|(_, off)| *off != named)
+                        .collect();
+                    // Two or more signatures agreeing with each other against
+                    // the name means the name found the wrong body.
+                    let consensus_against = stale.len() >= 2
+                        && stale.iter().all(|(_, off)| *off == stale[0].1);
+                    if consensus_against
+                        && on_conflict.unwrap_or_default() == ConflictPolicy::Fail
+                    {
+                        anyhow::bail!(
+                            "{label}: managed name {} resolves to 0x{:x} but {} signatures agree \
+                             on 0x{:x}; refusing to guess. Re-check the name, or set \
+                             on_conflict: prefer_managed once you know the signatures are stale.",
+                            query.display(),
+                            resolution.vmaddr,
+                            stale.len(),
+                            file_to_vm(parsed, stale[0].1)?
+                        )
+                    }
+                    source = format!(
+                        "{}{}",
+                        resolution.how,
+                        if agreeing.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                ", cross-checked by signature {}",
+                                agreeing
+                                    .iter()
+                                    .map(|n| n.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    );
+                    for (number, off) in &stale {
+                        notes.push(format!(
+                            "signature {number} is stale: it resolves to 0x{:x}, the name resolves \
+                             to 0x{:x}",
+                            file_to_vm(parsed, *off)?,
+                            resolution.vmaddr
+                        ));
+                    }
+                    for problem in &problems {
+                        notes.push(format!("{problem} (name resolved, so this is not fatal)"));
+                    }
+                    notes.extend(resolution.notes);
+                    chosen_instantiation = resolution.instantiation.clone();
+                    stub_from = resolution.stub_from;
+                    named
+                }
+                Err(managed_error) => {
+                    let (off, found) = locate_signatures(data, parsed, label, signatures)
+                        .map_err(|signature_error| {
+                            anyhow::anyhow!(
+                                "{label}: neither the managed name nor the signatures resolved.\n\
+                                 name: {managed_error}\nsignatures: {signature_error}"
+                            )
+                        })?;
+                    source = format!("{found} (managed name did not resolve)");
+                    notes.push(format!(
+                        "managed name {} did not resolve, fell back to signatures: {managed_error}",
+                        query.display()
+                    ));
+                    off
+                }
+            }
         }
         Locator::Pattern {
             pattern,
@@ -685,28 +872,15 @@ fn locate(
             expected_matches,
             segment,
             section,
-            fallback_rva,
         } => {
-            let pattern_result = (|| -> anyhow::Result<usize> {
-                let hits =
-                    pattern_hits(data, parsed, pattern, segment.as_deref(), section.as_deref())?;
-                if expected_matches.is_some_and(|count| hits.len() != count) {
-                    anyhow::bail!(
-                        "{label}: expected {expected_matches:?} pattern matches, found {}",
-                        hits.len()
-                    )
-                }
-                choose(hits, *match_index, label)
-            })();
-
-            match (pattern_result, fallback_rva) {
-                (Ok(off), _) => off,
-                (Err(_), Some(rva)) => {
-                    source = format!("fallback rva 0x{rva:x}");
-                    vm_to_file(parsed, image_base(parsed)? + *rva)?
-                }
-                (Err(error), None) => return Err(error),
+            let hits = pattern_hits(data, parsed, pattern, segment.as_deref(), section.as_deref())?;
+            if expected_matches.is_some_and(|count| hits.len() != count) {
+                anyhow::bail!(
+                    "{label}: expected {expected_matches:?} pattern matches, found {}",
+                    hits.len()
+                )
             }
+            choose(hits, *match_index, label)?
         }
         Locator::Symbol { symbol } | Locator::Export { symbol } => vm_to_file(parsed, symbol_address(data, symbol)?)?,
         Locator::Va { value } | Locator::Vmaddr { value } => vm_to_file(parsed, *value)?,
@@ -757,13 +931,21 @@ fn locate(
     if off % 4 != 0 {
         anyhow::bail!("{label}: resolved target is unaligned")
     }
-    Ok((off, file_to_vm(parsed, off)?, source))
+    Ok(Located {
+        offset: off,
+        vmaddr: file_to_vm(parsed, off)?,
+        source,
+        notes,
+        instantiation: chosen_instantiation,
+        stub_from,
+    })
 }
 fn locator_name(locator: &Locator) -> &'static str {
     match locator {
         Locator::Pattern { .. } => "pattern",
         Locator::Xref { .. } => "xref",
         Locator::Signatures { .. } => "signatures",
+        Locator::Managed { .. } => "managed name",
         Locator::Symbol { .. } => "symbol",
         Locator::Export { .. } => "export",
         Locator::Va { .. } | Locator::Vmaddr { .. } => "fixed vmaddr",
@@ -830,8 +1012,14 @@ pub struct PatchResolution {
     pub bytes: [u8; 4],
     pub automatic: bool,
     pub original_vmaddr: Option<u64>,
-    /// How the target was found, e.g. "signature 1, 2 of 2" or a fallback.
+    /// How the target was found, e.g. "signature 1, 2 of 2".
     pub located_by: String,
+    /// Cross-check, stub and degradation notes from a managed resolution.
+    pub notes: Vec<String>,
+    /// The generic instantiation that was hooked, when one was chosen.
+    pub instantiation: Option<String>,
+    /// The entry address before an entry stub was followed.
+    pub stub_from: Option<u64>,
 }
 #[derive(Debug)]
 pub struct PatchFailure {
@@ -841,9 +1029,8 @@ pub struct PatchFailure {
 #[derive(Debug, Default, Clone)]
 pub struct PatchOptions {
     pub load_dylib: bool,
-    /// Detected app/Unity versions; a `signatures` fallback rva is used only
-    /// when its version is among them.
-    pub app_versions: Vec<String>,
+    /// `global-metadata.dat` from the same IPA, for `managed` locators.
+    pub metadata: Option<std::path::PathBuf>,
 }
 #[cfg(test)]
 pub fn patch(m: &Manifest, input: &Path, output: &Path) -> anyhow::Result<PatchReport> {
@@ -903,14 +1090,75 @@ pub fn patch_with_options(
         .iter()
         .map(|x| (x.name.as_str(), x.index))
         .collect();
+    // A managed index is only built when a hook actually names its target.
+    let wants_managed = m.patches.iter().filter(|p| p.enabled).any(|p| {
+        matches!(&p.locator, Locator::Managed { .. })
+            || matches!(
+                &p.locator,
+                Locator::Signatures {
+                    managed: Some(_),
+                    use_managed: true,
+                    ..
+                }
+            )
+    });
+    let metadata_bytes;
+    let mut managed_index = None;
+    let mut managed_error = None;
+    if wants_managed {
+        match &options.metadata {
+            Some(path) => match std::fs::read(path) {
+                Ok(bytes) => {
+                    metadata_bytes = bytes;
+                    match ManagedIndex::build(&original, &metadata_bytes) {
+                        Ok(index) => managed_index = Some(index),
+                        Err(error) => managed_error = Some(error.to_string()),
+                    }
+                }
+                Err(error) => {
+                    managed_error = Some(format!("cannot read {}: {error}", path.display()))
+                }
+            },
+            None => {
+                managed_error = Some(
+                    "this IPA has no global-metadata.dat, or this module is not the IL2CPP module"
+                        .into(),
+                )
+            }
+        }
+    }
+    let locate_context = LocateContext {
+        managed: managed_index.as_ref(),
+        managed_error,
+    };
+    if let Some(index) = &locate_context.managed {
+        let summary = index.summary();
+        println!(
+            "  managed locator: {}",
+            summary
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     let mut targets = Vec::new();
     let mut resolutions = Vec::new();
     let mut failures = Vec::new();
     let mut target_offsets = HashSet::new();
     let mut sources: HashMap<String, String> = HashMap::new();
+    let mut patch_notes: HashMap<String, Vec<String>> = HashMap::new();
+    let mut patch_managed: HashMap<String, (Option<String>, Option<u64>)> = HashMap::new();
     for p in m.patches.iter().filter(|p| p.enabled) {
         let resolved = (|| -> anyhow::Result<_> {
-            let (off, vm, source) = locate(&original, &parsed, m, p, &options.app_versions)?;
+            let located = locate(&original, &parsed, m, p, &locate_context)?;
+            let (off, vm, source, notes) = (
+                located.offset,
+                located.vmaddr,
+                located.source,
+                located.notes,
+            );
+            patch_managed.insert(p.name.clone(), (located.instantiation, located.stub_from));
             let bytes: [u8; 4] = original
                 .get(off..off + 4)
                 .ok_or_else(|| anyhow::anyhow!("resolved instruction is truncated"))?
@@ -928,6 +1176,7 @@ pub fn patch_with_options(
                 anyhow::bail!("another enabled patch already targets file offset 0x{off:x}")
             }
             sources.insert(p.name.clone(), source);
+            patch_notes.insert(p.name.clone(), notes);
             Ok((off, vm, bytes, u32::from_le_bytes(bytes)))
         })();
         let (off, vm, bytes, displaced) = match resolved {
@@ -980,6 +1229,7 @@ pub fn patch_with_options(
                     )))
                 }
             };
+            let managed_detail = patch_managed.remove(&patch.name).unwrap_or_default();
             resolutions.push(PatchResolution {
                 name: patch.name.clone(),
                 vmaddr: vm,
@@ -987,6 +1237,9 @@ pub fn patch_with_options(
                 automatic: patch.expect.as_deref().is_none_or(|value| value == "auto"),
                 original_vmaddr: None,
                 located_by: sources.remove(&patch.name).unwrap_or_default(),
+                notes: patch_notes.remove(&patch.name).unwrap_or_default(),
+                instantiation: managed_detail.0,
+                stub_from: managed_detail.1,
             });
             direct_rewrites.push((off, vm, target_vm));
         } else {
@@ -1098,6 +1351,7 @@ pub fn patch_with_options(
                 original_vm,
             );
         }
+        let managed_detail = patch_managed.remove(&p.name).unwrap_or_default();
         resolutions.push(PatchResolution {
             name: p.name.clone(),
             vmaddr: vm,
@@ -1105,6 +1359,9 @@ pub fn patch_with_options(
             automatic: p.expect.as_deref().is_none_or(|x| x == "auto"),
             original_vmaddr: original_vm,
             located_by: sources.remove(&p.name).unwrap_or_default(),
+            notes: patch_notes.remove(&p.name).unwrap_or_default(),
+            instantiation: managed_detail.0,
+            stub_from: managed_detail.1,
         });
         cave.extend_from_slice(&bytes);
         redirects.push((off, vm, bridge_address, patch_width));
@@ -1354,8 +1611,7 @@ fn verify_data(
     }
     if p.segments
         .iter()
-        .filter(|segment| segment.filesize > 0)
-        .next_back()
+        .rfind(|segment| segment.filesize > 0)
         .is_none_or(|segment| segment.name != "__LINKEDIT")
     {
         anyhow::bail!("__LINKEDIT is not the final file-backed segment")
@@ -1649,10 +1905,13 @@ mod tests {
             tail,
             signature(SignatureKind::Direct, "DE AD BE EF"),
         ];
-        let (off, source) = locate_signatures(&d, &parsed, "t", &signatures, None, &[]).unwrap();
+        let (off, source) = locate_signatures(&d, &parsed, "t", &signatures).unwrap();
         assert_eq!(off, 0x800);
         assert!(source.starts_with("signature 1, 2, 3 of 4"), "{source}");
-        assert!(source.contains("signature 4 (Direct): no match"), "{source}");
+        assert!(
+            source.contains("signature 4 (Direct): no match"),
+            "{source}"
+        );
     }
 
     #[test]
@@ -1661,7 +1920,7 @@ mod tests {
         let parsed = parse(&d).unwrap();
         let mut site = signature(SignatureKind::Direct, "FF 43 00 D1 40 05 80 52");
         site.offset = Some(8);
-        let (off, _) = locate_signatures(&d, &parsed, "t", &[site], None, &[]).unwrap();
+        let (off, _) = locate_signatures(&d, &parsed, "t", &[site]).unwrap();
         assert_eq!(off, 0x808);
     }
 
@@ -1675,33 +1934,122 @@ mod tests {
             signature(SignatureKind::Xref, "?? ?? ?? 94 E0 03 13 AA"),
             shifted,
         ];
-        let error = locate_signatures(&d, &parsed, "t", &signatures, None, &[]).unwrap_err();
+        let error = locate_signatures(&d, &parsed, "t", &signatures).unwrap_err();
         assert!(error.to_string().contains("disagree"), "{error}");
     }
 
+    /// Builds a patch whose locator is `signatures` plus a managed name.
+    fn managed_patch(
+        managed: Option<&str>,
+        use_managed: bool,
+        on_conflict: Option<ConflictPolicy>,
+        signatures: Vec<Signature>,
+    ) -> Patch {
+        let mut m = manifest();
+        let mut patch = m.patches.remove(0);
+        patch.locator = Locator::Signatures {
+            signatures,
+            managed: managed.map(str::to_string),
+            use_managed,
+            assembly: None,
+            instantiation: None,
+            on_conflict,
+            offset: None,
+            follow_entry_stub: None,
+        };
+        patch
+    }
+
+    /// Without metadata there is no index, so a named hook must fall back to
+    /// its signatures and say so rather than failing the build.
     #[test]
-    fn fallback_rva_is_used_only_for_its_version() {
+    fn a_named_hook_falls_back_to_signatures_without_metadata() {
         let d = signature_fixture();
         let parsed = parse(&d).unwrap();
-        let signatures = [signature(SignatureKind::Direct, "DE AD BE EF")];
-        let fallback = VersionedRva {
-            rva: 0x800,
-            version: "56.3".into(),
+        let m = manifest();
+        let patch = managed_patch(
+            Some("Ns.Class::Method()"),
+            true,
+            None,
+            vec![signature(SignatureKind::Direct, "FF 43 00 D1 40 05 80 52")],
+        );
+        let ctx = LocateContext {
+            managed: None,
+            managed_error: Some("no metadata was supplied".into()),
         };
-        let (off, source) = locate_signatures(
-            &d,
-            &parsed,
-            "t",
-            &signatures,
-            Some(&fallback),
-            &["6000.0.58f2".into(), "56.3".into()],
-        )
-        .unwrap();
-        assert_eq!(off, 0x800);
-        assert!(source.starts_with("fallback rva 0x800 for version 56.3"), "{source}");
-        let error = locate_signatures(&d, &parsed, "t", &signatures, Some(&fallback), &["57.0".into()])
-            .unwrap_err();
-        assert!(error.to_string().contains("only valid for version 56.3"), "{error}");
+        let located = locate(&d, &parsed, &m, &patch, &ctx).unwrap();
+        assert_eq!(located.offset, 0x800);
+        assert!(
+            located.source.contains("managed name did not resolve"),
+            "{}",
+            located.source
+        );
+        assert!(
+            located
+                .notes
+                .iter()
+                .any(|note| note.contains("fell back to signatures")),
+            "{:?}",
+            located.notes
+        );
+    }
+
+    /// `use_managed: false` keeps the name in the manifest without acting on
+    /// it, so the hook behaves exactly like a signatures-only hook.
+    #[test]
+    fn a_recorded_name_is_ignored_when_the_toggle_is_off() {
+        let d = signature_fixture();
+        let parsed = parse(&d).unwrap();
+        let m = manifest();
+        let patch = managed_patch(
+            Some("Ns.Class::Method()"),
+            false,
+            None,
+            vec![signature(SignatureKind::Direct, "FF 43 00 D1 40 05 80 52")],
+        );
+        let ctx = LocateContext::default();
+        let located = locate(&d, &parsed, &m, &patch, &ctx).unwrap();
+        assert_eq!(located.offset, 0x800);
+        assert!(
+            located.source.starts_with("signature 1 of 1"),
+            "{}",
+            located.source
+        );
+        assert!(
+            located
+                .notes
+                .iter()
+                .any(|note| note.contains("recorded but ignored")),
+            "{:?}",
+            located.notes
+        );
+    }
+
+    /// Neither side resolving must report both failures, not just one.
+    #[test]
+    fn a_named_hook_reports_both_failures() {
+        let d = signature_fixture();
+        let parsed = parse(&d).unwrap();
+        let m = manifest();
+        let patch = managed_patch(
+            Some("Ns.Class::Method()"),
+            true,
+            None,
+            vec![signature(SignatureKind::Direct, "DE AD BE EF")],
+        );
+        let ctx = LocateContext {
+            managed: None,
+            managed_error: Some("no metadata was supplied".into()),
+        };
+        let error = locate(&d, &parsed, &m, &patch, &ctx)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("neither the managed name nor the signatures"),
+            "{error}"
+        );
+        assert!(error.contains("no metadata was supplied"), "{error}");
+        assert!(error.contains("no match"), "{error}");
     }
 
     #[test]
@@ -1825,17 +2173,16 @@ mod tests {
         std::fs::write(&input, fixture(0x400, 0xd503201f)).unwrap();
         let mut m = manifest();
         m.patches[0].expect = Some("auto".into());
-        let report =
-            patch_with_options(
-                &m,
-                &input,
-                &output,
-                PatchOptions {
-                    load_dylib: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let report = patch_with_options(
+            &m,
+            &input,
+            &output,
+            PatchOptions {
+                load_dylib: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(report.resolutions[0].automatic);
         assert_eq!(report.resolutions[0].bytes, [0x1f, 0x20, 0x03, 0xd5]);
         assert!(report.added_dylib_load_command);

@@ -28,6 +28,9 @@ pub struct Manifest {
     pub patches: Vec<Patch>,
     #[serde(skip)]
     pub source_dir: PathBuf,
+    /// Ignored legacy settings, reported by the CLI.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct Project {
@@ -43,93 +46,7 @@ pub struct Runtime {
     pub cave_segment: String,
     pub page_size: u64,
     pub dylib_name: String,
-    /// Optional path to an IL2CPP metadata dump. This can be a directory or a
-    /// single file, in any of the auto-detected formats (see il2cpp_metadata.rs):
-    ///   * a Cpp2IL analysis package (cpp2il_methods.jsonl [+ cpp2il_types.jsonl])
-    ///   * an Il2CppDumper `script.json` (methods) and/or `dump.cs` (+ fields)
-    /// When set, any offline_* entry and the string factory may be specified by
-    /// name only and their address/offset is resolved from the dump at generate
-    /// time instead of being hand-typed. Resolved relative to source_dir.
-    #[serde(default)]
-    pub metadata_package: Option<PathBuf>,
-    /// Optional override for the metadata dump format: "auto" (default),
-    /// "cpp2il", or "il2cpp_dumper". Leave unset to detect from the files present.
-    #[serde(default)]
-    pub metadata_format: Option<String>,
-    /// Optional RVA of the target's own UTF-16 managed-string constructor.
-    /// This is used when a stripped Unity IL2CPP binary does not export
-    /// il2cpp_string_new but still contains its generated String runtime.
-    /// When `string_factory` (name-based) and `metadata_package` are set this
-    /// is resolved automatically; an explicit value here still wins.
-    #[serde(default)]
-    pub string_factory_rva: Option<u64>,
-    /// Optional name-based spec for the managed-string constructor, resolved
-    /// against metadata_package into string_factory_rva.
-    #[serde(default)]
-    pub string_factory: Option<OfflineMethod>,
-    #[serde(default)]
-    pub offline_classes: Vec<OfflineClass>,
-    #[serde(default)]
-    pub offline_methods: Vec<OfflineMethod>,
-    #[serde(default)]
-    pub offline_fields: Vec<OfflineField>,
-    #[serde(default)]
-    pub offline_internal_calls: Vec<OfflineInternalCall>,
 }
-#[derive(Clone, Debug, Deserialize)]
-pub struct OfflineClass {
-    pub module: String,
-    pub namespace: String,
-    pub name: String,
-}
-#[derive(Clone, Debug, Deserialize)]
-pub struct OfflineMethod {
-    pub module: String,
-    pub namespace: String,
-    #[serde(rename = "class")]
-    pub class_name: String,
-    pub name: String,
-    #[serde(default = "default_parameter_count")]
-    pub parameter_count: i32,
-    /// Optional exact managed parameter-type list (e.g. ["System.Char*"]) used
-    /// to disambiguate overloads that share an arity when resolving from the
-    /// metadata package. Takes precedence over parameter_count for matching.
-    #[serde(default)]
-    pub parameter_types: Option<Vec<String>>,
-    /// Explicit native RVA. Optional when metadata_package is set (resolved by
-    /// name); an explicit value always wins over dump resolution.
-    #[serde(default)]
-    pub rva: Option<u64>,
-}
-#[derive(Clone, Debug, Deserialize)]
-pub struct OfflineField {
-    pub module: String,
-    pub namespace: String,
-    #[serde(rename = "class")]
-    pub class_name: String,
-    pub name: String,
-    /// Explicit field offset. Optional when metadata_package is set.
-    #[serde(default)]
-    pub offset: Option<u64>,
-    /// Field size in bytes. Optional; filled from the dump, else defaults to a
-    /// pointer width when neither the manifest nor the dump provides it.
-    #[serde(default)]
-    pub size: Option<u64>,
-}
-#[derive(Clone, Debug, Deserialize)]
-pub struct OfflineInternalCall {
-    pub name: String,
-    pub module: String,
-    /// Explicit native RVA. Optional when metadata_package is set.
-    #[serde(default)]
-    pub rva: Option<u64>,
-}
-fn default_parameter_count() -> i32 {
-    -1
-}
-/// Fallback field width (pointer size) when neither the manifest nor the
-/// metadata package supplies a size for an offline field.
-pub const DEFAULT_FIELD_SIZE: u64 = 8;
 #[derive(Clone, Debug, Deserialize)]
 pub struct App {
     /// Remove the device-model allowlist from the main app's Info.plist.
@@ -328,7 +245,6 @@ pub enum Locator {
         expected_matches: Option<usize>,
         segment: Option<String>,
         section: Option<String>,
-        fallback_rva: Option<u64>,
     },
     Xref {
         pattern: String,
@@ -338,11 +254,41 @@ pub enum Locator {
         xref_bl_index: Option<usize>,
     },
     /// Several independent signatures for one target. Every signature that
-    /// resolves must agree; `fallback` is used only when none resolves and
-    /// the detected app/Unity version equals `fallback.version`.
+    /// resolves must agree, and at least one must resolve.
+    ///
+    /// `managed` adds the target's managed name. With `use_managed: true` the
+    /// name is authoritative and the signatures become a cross-check; with
+    /// `use_managed: false` (the default) the name is recorded but ignored.
     Signatures {
         signatures: Vec<Signature>,
-        fallback: Option<VersionedRva>,
+        #[serde(default)]
+        managed: Option<String>,
+        #[serde(default)]
+        use_managed: bool,
+        #[serde(default)]
+        assembly: Option<String>,
+        #[serde(default)]
+        instantiation: Option<Instantiation>,
+        #[serde(default)]
+        on_conflict: Option<ConflictPolicy>,
+        #[serde(default)]
+        offset: Option<i64>,
+        #[serde(default)]
+        follow_entry_stub: Option<bool>,
+    },
+    /// The target named as a managed method, resolved from the IPA's own
+    /// metadata at build time. No signatures, so a lookup failure fails the
+    /// patch by name under its `failure_behavior`.
+    Managed {
+        method: String,
+        #[serde(default)]
+        assembly: Option<String>,
+        #[serde(default)]
+        instantiation: Option<Instantiation>,
+        #[serde(default)]
+        offset: Option<i64>,
+        #[serde(default)]
+        follow_entry_stub: Option<bool>,
     },
     Symbol {
         symbol: String,
@@ -375,6 +321,32 @@ pub enum Locator {
     },
 }
 
+/// Which native copy of a generic method a managed name selects.
+///
+/// A string is `shared` (the copy every reference-type argument runs; `object`
+/// and `fully_shared` are accepted spellings of it) or `any` (the only copy,
+/// when there is exactly one). A list names one instantiation's type
+/// arguments, where `*` matches a position.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Instantiation {
+    Named(String),
+    Args(Vec<String>),
+}
+
+/// What to do when a managed name and a signature disagree.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictPolicy {
+    /// Fail the patch when two or more signatures agree with each other and
+    /// disagree with the name: that pattern means the name found the wrong
+    /// body, and patching it would be worse than not building.
+    #[default]
+    Fail,
+    /// Always take the named address and report the signatures as stale.
+    PreferManaged,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SignatureKind {
@@ -397,13 +369,6 @@ pub struct Signature {
     /// Pick one of several matches instead of requiring exactly one.
     #[serde(default)]
     pub match_index: Option<usize>,
-}
-
-/// A build-specific address, trusted only for the version it was taken from.
-#[derive(Clone, Debug, Deserialize)]
-pub struct VersionedRva {
-    pub rva: u64,
-    pub version: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -516,6 +481,71 @@ fn force_il2cpp_disabled(value: &mut serde_yaml::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Settings from the dump-based workflow. IL2CPP members are now resolved by
+/// name at runtime and patches only by signature, so these are removed with a
+/// warning instead of silently baking in a previous build's addresses.
+const LEGACY_RUNTIME_KEYS: &[&str] = &[
+    "metadata_package",
+    "metadata_format",
+    "string_factory",
+    "string_factory_rva",
+    "offline_classes",
+    "offline_methods",
+    "offline_fields",
+    "offline_internal_calls",
+];
+
+fn strip_legacy_settings(root: &mut serde_yaml::Value) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let key = |name: &str| serde_yaml::Value::String(name.to_owned());
+    if let Some(runtime) = root
+        .as_mapping_mut()
+        .and_then(|map| map.get_mut(key("runtime")))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+    {
+        for name in LEGACY_RUNTIME_KEYS {
+            if runtime.remove(key(name)).is_some() {
+                warnings.push(format!(
+                    "runtime.{name} is no longer used: IL2CPP classes, methods and fields are found by name at runtime, so no dump is needed. Remove it."
+                ));
+            }
+        }
+    }
+    if let Some(patches) = root
+        .as_mapping_mut()
+        .and_then(|map| map.get_mut(key("patches")))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+    {
+        for patch in patches {
+            let name = patch
+                .get("name")
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or("<unnamed>")
+                .to_owned();
+            if let Some(locator) = patch
+                .get_mut("locator")
+                .and_then(serde_yaml::Value::as_mapping_mut)
+            {
+                for field in ["fallback", "fallback_rva"] {
+                    if locator.remove(key(field)).is_some() {
+                        warnings.push(format!(
+                            "patch {name}: locator.{field} is no longer used; the patch is located by its patterns only. Remove it."
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    warnings
+}
+
+/// Prints the legacy settings `load` ignored, so a project can drop them.
+pub fn report_warnings(m: &Manifest) {
+    for warning in &m.warnings {
+        println!("warning: {warning}");
+    }
+}
+
 pub fn load(path: &Path) -> anyhow::Result<Manifest> {
     let hooks = read_yaml(path, "hook manifest")?;
     let references: ManifestReferences = serde_yaml::from_value(hooks.clone())
@@ -571,9 +601,12 @@ pub fn load(path: &Path) -> anyhow::Result<Manifest> {
         hooks
     };
 
+    let mut effective = effective;
+    let warnings = strip_legacy_settings(&mut effective);
     let mut manifest: Manifest = serde_yaml::from_value(effective)
         .with_context(|| format!("cannot construct manifest from {}", path.display()))?;
     manifest.source_dir = source_dir.to_path_buf();
+    manifest.warnings = warnings;
     expand_replacement_shorthand(&mut manifest)?;
     Ok(manifest)
 }
@@ -749,11 +782,43 @@ fn unique<T: std::hash::Hash + Eq + Copy>(
     }
     Ok(())
 }
-fn validate_signatures(
+/// Checks a managed name and its options without touching any binary, so a
+/// typo fails at manifest load instead of mid-patch.
+fn validate_managed(
     name: &str,
-    signatures: &[Signature],
-    fallback: Option<&VersionedRva>,
+    managed: Option<&str>,
+    instantiation: Option<&Instantiation>,
+    offset: Option<i64>,
 ) -> Result<(), IaotError> {
+    let invalid = |detail: String| Err(IaotError::Manifest(format!("patch {name} {detail}")));
+    let Some(spec) = managed else {
+        return Ok(());
+    };
+    if let Err(error) = crate::il2cpp_name::ManagedQuery::parse(spec) {
+        return invalid(format!("has an invalid managed name: {error}"));
+    }
+    if let Some(instantiation) = instantiation {
+        match instantiation {
+            Instantiation::Named(word) => {
+                if !matches!(word.as_str(), "shared" | "object" | "fully_shared" | "any") {
+                    return invalid(format!(
+                        "has instantiation '{word}'; use shared, any, or a list of type arguments"
+                    ));
+                }
+            }
+            Instantiation::Args(args) => {
+                if args.is_empty() {
+                    return invalid("has an empty instantiation list".into());
+                }
+            }
+        }
+    }
+    if offset.is_some_and(|offset| offset % 4 != 0) {
+        return invalid("managed offset is unaligned".into());
+    }
+    Ok(())
+}
+fn validate_signatures(name: &str, signatures: &[Signature]) -> Result<(), IaotError> {
     let invalid = |detail: String| Err(IaotError::Manifest(format!("patch {name} {detail}")));
     if signatures.is_empty() {
         return invalid("needs at least one signature".into());
@@ -771,7 +836,9 @@ fn validate_signatures(
         match signature.kind {
             SignatureKind::Direct => {
                 if signature.branch_index.is_some() {
-                    return invalid(format!("signature {number} is direct but sets branch_index"));
+                    return invalid(format!(
+                        "signature {number} is direct but sets branch_index"
+                    ));
                 }
                 if signature.offset.is_some_and(|offset| offset % 4 != 0) {
                     return invalid(format!("signature {number} offset is unaligned"));
@@ -792,14 +859,6 @@ fn validate_signatures(
                     ));
                 }
             }
-        }
-    }
-    if let Some(fallback) = fallback {
-        if fallback.rva % 4 != 0 {
-            return invalid("fallback rva is unaligned".into());
-        }
-        if fallback.version.trim().is_empty() {
-            return invalid("fallback needs the version its rva was taken from".into());
         }
     }
     Ok(())
@@ -1170,8 +1229,41 @@ pub fn validate(m: &Manifest) -> Result<(), IaotError> {
             }
             Locator::Signatures {
                 signatures,
-                fallback,
-            } => validate_signatures(&patch.name, signatures, fallback.as_ref())?,
+                managed,
+                use_managed,
+                instantiation,
+                on_conflict,
+                offset,
+                ..
+            } => {
+                validate_signatures(&patch.name, signatures)?;
+                if managed.is_none() {
+                    if *use_managed {
+                        return Err(IaotError::Manifest(format!(
+                            "patch {} sets use_managed without a managed name",
+                            patch.name
+                        )));
+                    }
+                    if instantiation.is_some() || on_conflict.is_some() || offset.is_some() {
+                        return Err(IaotError::Manifest(format!(
+                            "patch {} uses a managed-only option without a managed name",
+                            patch.name
+                        )));
+                    }
+                }
+                validate_managed(
+                    &patch.name,
+                    managed.as_deref(),
+                    instantiation.as_ref(),
+                    *offset,
+                )?;
+            }
+            Locator::Managed {
+                method,
+                instantiation,
+                offset,
+                ..
+            } => validate_managed(&patch.name, Some(method), instantiation.as_ref(), *offset)?,
             Locator::Symbol { symbol } | Locator::Export { symbol } if symbol.is_empty() => {
                 return Err(IaotError::Manifest(format!(
                     "patch {} has an empty symbol",
@@ -1429,21 +1521,15 @@ mod tests {
             "{ type: signatures, signatures: [\
                { kind: xref, pattern: '?? ?? ?? 94 E0 03 13 AA' },\
                { kind: xref, pattern: '00 00 80 D2 ?? ?? ?? 17', branch_index: 1 },\
-               { kind: direct, pattern: 'FF ?? ?? D1 ?? ?? ?? A9', offset: 8 }],\
-             fallback: { rva: 0x265CE40, version: '56.3' } }",
+               { kind: direct, pattern: 'FF ?? ?? D1 ?? ?? ?? A9', offset: 8 }] }",
         );
         validate(&m).unwrap();
-        let Locator::Signatures {
-            signatures,
-            fallback,
-        } = &m.patches[0].locator
-        else {
+        let Locator::Signatures { signatures, .. } = &m.patches[0].locator else {
             panic!("expected a signatures locator")
         };
         assert_eq!(signatures.len(), 3);
         assert_eq!(signatures[1].branch_index, Some(1));
         assert_eq!(signatures[2].offset, Some(8));
-        assert_eq!(fallback.as_ref().unwrap().rva, 0x265CE40);
     }
     #[test]
     fn signatures_locator_rejects_bad_shapes() {
@@ -1456,8 +1542,6 @@ mod tests {
             "{ type: signatures, signatures: [{ kind: direct, pattern: 'FF 43 00' }] }",
             "{ type: signatures, signatures: [{ kind: direct, pattern: 'FF 43 00 D1', offset: 2 }] }",
             "{ type: signatures, signatures: [{ kind: direct, pattern: 'FF 43 00 D1', branch_index: 0 }] }",
-            // A fallback must say which version its rva belongs to.
-            "{ type: signatures, signatures: [{ kind: direct, pattern: 'FF 43 00 D1' }], fallback: { rva: 0x1000, version: '' } }",
         ] {
             assert!(validate(&signatures_patch(locator)).is_err(), "{locator}");
         }
@@ -1596,7 +1680,7 @@ mod tests {
         .unwrap();
         fs::write(
             directory.path().join("il2cpp_config.yaml"),
-            "analysis: { scripting_backend: il2cpp, static_il2cpp: true, runtime_il2cpp: true, il2cpp_module: UnityFramework }\nruntime: { offline_classes: [{ module: Assembly-CSharp, namespace: Demo, name: Player }] }\n",
+            "analysis: { scripting_backend: il2cpp, static_il2cpp: true, runtime_il2cpp: true, il2cpp_module: UnityFramework }\nruntime: { metadata_package: dumps, offline_classes: [{ module: Assembly-CSharp, namespace: Demo, name: Player }] }\n",
         )
         .unwrap();
 
@@ -1606,7 +1690,8 @@ mod tests {
             loaded.analysis.il2cpp_module.as_deref(),
             Some("UnityFramework")
         );
-        assert_eq!(loaded.runtime.offline_classes.len(), 1);
+        // Dump-era keys are reported and dropped; members resolve at runtime.
+        assert_eq!(loaded.warnings.len(), 2, "{:?}", loaded.warnings);
         validate(&loaded).unwrap();
     }
 }

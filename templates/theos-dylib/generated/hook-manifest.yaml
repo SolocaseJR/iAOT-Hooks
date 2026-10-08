@@ -7,6 +7,10 @@ hooks:
   enabled: false
   module: main
   signature: int(void*, int)
-  original_slot: 0
+  original_slot: null
   failure_behavior: disable_hook
 objective_c_hooks: []
+generated_hooks:
+- name: UserHooks
+  enabled: true
+  symbol: IAOT_InstallUserHooks
