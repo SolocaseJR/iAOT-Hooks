@@ -28,7 +28,7 @@ Name only:
 ```yaml
     locator:
       type: managed
-      method: "Assets.Scripts.Unity.Player.Btd6Player::ConsumePower(System.String, System.Int32)"
+      method: "Example.Game.Player::ConsumePower(System.String, System.Int32)"
 ```
 
 Name plus signatures, with the toggle:
@@ -36,7 +36,7 @@ Name plus signatures, with the toggle:
 ```yaml
     locator:
       type: signatures
-      managed: "Assets.Scripts.Unity.Player.Btd6Player::ConsumePower(System.String, System.Int32)"
+      managed: "Example.Game.Player::ConsumePower(System.String, System.Int32)"
       use_managed: true
       signatures:
         - { kind: xref, pattern: "? ? ? 94 ? ? ? 11 ? ? ? B9 ? ? ? 17" }
